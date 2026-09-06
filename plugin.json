@@ -1,0 +1,19 @@
+{
+ "pluginmetadataversion": 2,
+ "name": "OORecover",
+ "type": [
+  "helper"
+ ],
+ "api": [
+  "python3"
+ ],
+ "description": "Recover C++ classes (vtables, Itanium and MSVC RTTI, members, inheritance, typed vtables) via MLIL SSA analysis",
+ "longdescription": "OOAnalyzer-style C++ object recovery built on Binary Ninja analysis. Finds vtables via symbols, RTTI headers and pointer scans (Itanium and MSVC ABIs, 32 and 64 bit), collects this-pointer facts from MLIL SSA (vtable installs, member accesses, constructor chains, allocations), and applies structures with embedded bases, typed vtable structures, named methods and typed this parameters. Classes without any vtable are recovered from their mangled member functions (members, constructors, embedded bases). Builds without RTTI keep their real class names when symbols survive: from the vtable symbol, whose group of tables also gives the sub-object offsets, or from the constructor and destructor symbols that store each table. Virtual calls are resolved to their implementations (xrefs from call sites), including calls through parameters of free functions and non-virtual members. Methods returning a structure by value get a native hidden-pointer return location, with this in the following register. Consistency checks withdraw contradictory conclusions (members past the object, folded functions, inheritance cycles). Existing class types are kept; Binary Ninja's own RTTI vtable types are updated in place under their names and its symbols are preserved. Every run is one undo action.",
+ "version": "0.1.0",
+ "author": "Monty",
+ "minimumsupportedversion": "4300",
+ "license": {
+  "name": "MIT",
+  "text": "Copyright (c) 2026 Monty\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
+ }
+}
