@@ -102,7 +102,7 @@ def symbol_role(bv, addr):
     return None
 
 
-def _hidden_this(func):
+def hidden_this(func):
     """True when the function reads the integer argument register after
     the ones its declared explicit parameters occupy: a member whose this
     the signature omits (5.3), or a 6.0 signature whose bogus this pushed
@@ -242,7 +242,7 @@ def scan_scopes(bv, class_names=(), log=print):
     (a namespace nesting classes; a struct returned by value reads one
     register more, which would pass for a hidden this), is a class when one
     of its functions reads the argument register past its explicit list
-    (_hidden_this). Cached per view; returns ({function start: scope},
+    (hidden_this). Cached per view; returns ({function start: scope},
     classes, functions whose scope flipped since the previous scan)."""
     global _SCOPES, _ARITY
     t0 = time.time()
@@ -306,7 +306,7 @@ def scan_scopes(bv, class_names=(), log=print):
         if start not in arity:
             checked += 1
             try:
-                arity[start] = _hidden_this(bv.get_function_at(start))
+                arity[start] = hidden_this(bv.get_function_at(start))
             except Exception:
                 arity[start] = None
         if arity[start]:

@@ -396,14 +396,51 @@ def apply_virtual_calls(bv, vcalls, log=print):
 def _declared_shift(bv, func):
     """Register-numbered argument index minus declared parameter index: 1 for
     a member function whose demangled signature omits the implicit this
-    (Binary Ninja 5.3 and earlier; 6.0 declares it)."""
+    (Binary Ninja 5.3 and earlier; 6.0 declares it), and for a non-member
+    returning a struct through the hidden pointer, whose parameters follow
+    the buffer."""
     try:
-        params = list(func.type.parameters)
+        ftype = func.type
+        params = list(ftype.parameters)
     except Exception:
         return 0
-    if member(bv, func) and not (params and params[0].name == "this"):
-        return 1
+    if member(bv, func) or (mangled(func) and _is_indirect(ftype)):
+        return 0 if params and params[0].name == "this" else 1
     return 0
+
+
+def apply_struct_returns(bv, facts, result_types, claimed, retyped, own, log=print):
+    """Namespace functions returning a struct by value: the hidden buffer
+    becomes the native indirect return (a placeholder sized from the writes,
+    or the class the model resolved) and the mangled name's explicit list
+    follows it at the calling convention's default locations."""
+    typed = 0
+    for faddr, ff in sorted(facts.items()):
+        if not ff.sret or faddr in claimed:
+            continue
+        func = bv.get_function_at(faddr)
+        if func is None or not mangled(func) or member(bv, func) or msvc_static(func):
+            continue
+        try:
+            ftype = func.type
+            demangled = demangle(bv, func.symbol.raw_name)
+            if demangled is None or demangled[0] is None \
+                    or demangled[0].type_class != TypeClass.FunctionTypeClass:
+                continue
+            params = list(demangled[0].parameters)
+            if params and params[0].name == "this":
+                params = params[1:]
+            name = "::".join(demangled[1])
+            ret = _indirect_return(bv, func, ftype, name, ff.sret_size, own, result_types.get(faddr))
+            if retyped(func, ftype, Type.function(
+                    ret, _default_locations(params), calling_convention=ftype.calling_convention,
+                    variable_arguments=ftype.has_variable_arguments), force=True):
+                typed += 1
+        except Exception as e:
+            log("[oorecover] struct return %#x failed: %s" % (faddr, e))
+    if typed:
+        log("[oorecover] %d free functions given a struct return" % typed)
+    return typed
 
 
 def apply_namespace_functions(bv, retyped, log=print):
@@ -812,6 +849,7 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
             | {fn for cls in order for fn in cls.shared} | set(unowned)
         namespaces = apply_namespace_functions(bv, changed, log)
         if facts:
+            namespaces += apply_struct_returns(bv, facts, result_types, claimed, changed, own, log)
             newly_typed += apply_member_this(bv, facts, set(by_name), claimed, changed, log)
         apply_unowned(bv, unowned, changed, log)
         if instances:

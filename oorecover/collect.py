@@ -15,7 +15,7 @@ from binaryninja import MediumLevelILOperation as Op
 from binaryninja.enums import RegisterValueType, SymbolType, TypeClass, VariableSourceType
 
 from .facts import AllocCall, ArgPass, MemberAccess, ThisCall, VirtualCall, VtableInstall
-from .names import mangled, member, member_class, scan_scopes, symbol_role
+from .names import hidden_this, mangled, member, member_class, scan_scopes, symbol_role
 
 MAX_PASSES = 64
 MAX_ALLOC = 1 << 24
@@ -139,6 +139,25 @@ def _foreign_ctor(bv, func, callee):
 
 
 
+def _returns_first_register(bv, func, facts, insns, resolve):
+    """True when the function keyed its first argument register as this,
+    reads one register past its explicit parameters (names.hidden_this),
+    writes through that register and returns it on every return path. A
+    member returning *this (an assignment operator) does the same, so
+    callers restrict this to mangled non-members."""
+    if _returns_indirect(func) or not any(a.root == ("this",) and a.is_write for a in facts.accesses):
+        return False
+    if hidden_this(func) is not True:
+        return False
+    rets = [i for i in insns if i.operation == Op.MLIL_RET]
+    if not rets:
+        return False
+    for ret in rets:
+        if len(ret.src) != 1 or resolve(ret.src[0]) != (("this",), 0):
+            return False
+    return True
+
+
 def _returns_indirect(func):
     """True when the signature already returns through a hidden pointer."""
     loc = func.return_value_location
@@ -162,9 +181,13 @@ def _this_keys(bv, func, entry, sret=False):
     pvars = list(func.parameter_vars)
     storage = None
     if sret:
+        if mangled(func) and not member(bv, func):
+            return []       # a namespace function's buffer is followed by plain parameters
         storage = _storage_after_return_buffer(func)
     else:
         is_member = member(bv, func)
+        if _free_struct_return(bv, func):
+            return []       # typed so by an earlier pass
         named = [i for i, v in enumerate(pvars) if v.name == "this"][:1]
         if named and (is_member or not mangled(func)):
             storage = _param_storage(func, named[0])
@@ -198,10 +221,13 @@ def _reads_entry_this(func, ssa, entry):
     return False
 
 
-def _param_keys(func, entry, max_index):
+def _param_keys(func, entry, max_index, by_register=False):
     """{index: SSA keys} for parameters 1..max_index-1: the declared parameter
-    variable, else the matching integer argument register."""
-    params = list(func.parameter_vars)
+    variable, else the matching integer argument register. by_register
+    ignores the declared list: a namespace function returning a struct by
+    value has its buffer in register 0 and the parameters after it,
+    whatever the signature says."""
+    params = [] if by_register else list(func.parameter_vars)
     cc = func.calling_convention
     regs = list(cc.int_arg_regs) if cc is not None else []
     by_var = {}
@@ -292,6 +318,31 @@ def _const_pointee(t):
 
 
 _CALLEE_PARAMS = {}
+_CALLEE_BUFFER = {}
+
+
+def _free_struct_return(bv, func):
+    """True for a namespace function typed as returning a struct through
+    the hidden pointer: its parameters start at register 1, unlike a
+    method's, whose this follows the buffer. Only a mangled name says which
+    an unnamed function is, so those keep the method layout."""
+    return mangled(func) and not member(bv, func) and _returns_indirect(func)
+
+
+def _callee_buffer_first(bv, target):
+    """1 when the callee's listed parameters start at register 1
+    (_free_struct_return), else 0. Cached per pass like _callee_param_types."""
+    if target in _CALLEE_BUFFER:
+        return _CALLEE_BUFFER[target]
+    func = bv.get_function_at(target)
+    first = 0
+    if func is not None:
+        try:
+            first = 1 if _free_struct_return(bv, func) else 0
+        except Exception:
+            first = 0
+    _CALLEE_BUFFER[target] = first
+    return first
 
 
 def _callee_param_types(bv, call):
@@ -461,7 +512,8 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 alias(_key(sv), ("sret",), 0)
     facts.entry_this = _reads_entry_this(func, ssa, entry)
     facts.member_of = member_class(bv, func)
-    for index, keys in _param_keys(func, entry, MAX_PARAM_ROOTS).items():
+    by_register = facts.sret and mangled(func) and not member(bv, func)
+    for index, keys in _param_keys(func, entry, MAX_PARAM_ROOTS, by_register).items():
         for key in keys:
             alias(key, ("param", index), 0)
     t2 = time.perf_counter()
@@ -733,11 +785,29 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                                             is_deallocator(target)))
             if is_deallocator(target):
                 continue
-            for index, param in enumerate(insn.params[:MAX_PARAM_ROOTS]):
+            # Binary Ninja lists a callee's hidden return buffer nowhere: the
+            # parameters of a free function returning a struct by value start
+            # at register 1 (a method's this already sits there).
+            first = _callee_buffer_first(bv, target)
+            for index, param in enumerate(insn.params[:MAX_PARAM_ROOTS], first):
                 r = resolve(param)
                 if r is not None and r[1] >= 0:
                     facts.argpasses.append(ArgPass(func.start, insn.address, target, index, r[0], r[1]))
     _TIMES["rest"] += time.perf_counter() - t4
+    if not sret and mangled(func) and not member(bv, func) \
+            and _returns_first_register(bv, func, facts, insns, resolve):
+        # A namespace function that reads one argument register more than
+        # its mangled name declares, writes through the first and hands it
+        # back in the return register returns a struct by value: the first
+        # register is the hidden buffer, the parameters follow it. An auto
+        # signature declares too little to say the same of an unnamed one.
+        again = collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator,
+                                 debug, slot_functions, sret=True)
+        if again is not None:
+            again.sret = True
+            again.sret_size = max([a.offset + a.size for a in facts.accesses
+                                   if a.root == ("this",) and a.is_write] + [0])
+            return again
     if not sret and func.start in slot_functions and not facts.installs and (
             any(a.root == ("this",) and a.offset == 0 and a.is_write for a in facts.accesses)
             or any(c.root == ("this",) and c.offset == 0 and _foreign_ctor(bv, func, c.callee)
@@ -840,6 +910,7 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
     sret_hints are collected with the hidden return buffer keyed as such."""
     global _SEEN
     _CALLEE_PARAMS.clear()
+    _CALLEE_BUFFER.clear()
     for phase in _TIMES:
         _TIMES[phase] = 0.0
     is_allocator = _make_name_check(bv, abi.allocators, "operator new")

@@ -146,14 +146,6 @@ NOINLINE zoo::Stats::Stats(int seed) : total(seed), count(0), last(-1) {}
 NOINLINE int zoo::Stats::bump(int by) { total += by; count++; last = by; return total; }
 
 NOINLINE int use(zoo::Animal* a) { return a->speak() + a->legs(); }
-// The struct-returning calls live here so main's stack layout around its
-// objects stays as it is: the buffers would sit right behind them.
-NOINLINE int labels(zoo::Animal* a, zoo::Animal* b, zoo::Puppy* p) {
-    zoo::Label lb = a->label();
-    zoo::Label lb2 = b->label2();
-    zoo::Vec pv = p->pos();
-    return (int)(lb.id + lb2.extra + pv.z);
-}
 NOINLINE int measure(zoo::Shape* s) { return s->area(); }
 NOINLINE void flapit(zoo::Wing* w) { w->flap(); }
 
@@ -171,6 +163,11 @@ public:
 // mangled name with a bogus zoo* this in front of the real parameters.
 NOINLINE int feed(Animal* a, int n) { return a->speak() * n + a->legs(); }
 
+// A namespace function returning a struct by value: it writes through the
+// buffer in the first argument register and returns it, the Animal* sits
+// in the second.
+NOINLINE Vec where(Animal* a, int k) { Vec v; v.x = a->legs() + k; v.y = k; v.z = 0; return v; }
+
 // A class with no evidence but arity: inline constructor, no const member,
 // never a parameter type. bump reads a third argument register for its
 // two explicit parameters, so it has a hidden this.
@@ -181,6 +178,16 @@ public:
 };
 }
 zoo::Beacon g_beacon;
+
+// The struct-returning calls live here so main's stack layout around its
+// objects stays as it is: the buffers would sit right behind them.
+NOINLINE int labels(zoo::Animal* a, zoo::Animal* b, zoo::Puppy* p) {
+    zoo::Label lb = a->label();
+    zoo::Label lb2 = b->label2();
+    zoo::Vec pv = p->pos();
+    zoo::Vec w = zoo::where(b, 3);
+    return (int)(lb.id + lb2.extra + pv.z + w.x);
+}
 
 int main() {
     int r0 = 0;

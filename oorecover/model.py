@@ -1030,8 +1030,16 @@ def infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log=pr
             params = list(func.type.parameters)
         except Exception:
             continue
-        # Pre-6.0 demangled member signatures omit this: declared i is argument i+1.
-        shift = 1 if member(bv, func) and not (params and params[0].name == "this") else 0
+        # Pre-6.0 demangled member signatures omit this: declared i is argument
+        # i+1. The explicit list of a non-member returning a struct by value
+        # starts one register in as well, unless 6.0's bogus this still
+        # stands in for the buffer.
+        sym = func.symbol
+        free_sret = ff.sret and sym is not None and sym.raw_name.startswith("_Z") and not member(bv, func)
+        if member(bv, func) or free_sret:
+            shift = 0 if params and params[0].name == "this" else 1
+        else:
+            shift = 0
         for at, p in enumerate(params):
             index = at + shift
             t = p.type

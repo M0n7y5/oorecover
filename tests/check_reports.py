@@ -252,6 +252,14 @@ def check_struct_returns(name, rep):
         assert f is not None, (name, "struct-returning method not owned", sym)
         assert f["type"].startswith(prefix), (name, sym, "return type", f["type"])
         assert f["return_location"] and "*" in f["return_location"], (name, sym, f["return_location"])
+    # zoo::where returns a Vec through the hidden buffer in the first register;
+    # the namespace function keeps no this and its parameters follow the buffer.
+    where = [v for v in rep["vcalls"] if v["caller_name"] == "_ZN3zoo5whereEPNS_6AnimalEi"]
+    assert where, (name, "zoo::where's virtual call unresolved")
+    for v in where:
+        assert v["class"] == "zoo::Animal" and v["target_names"] == ["_ZN3zoo6Animal4legsEv"], (name, "zoo::where site", v)
+        assert re.fullmatch(r"struct zoo::where_result\(struct zoo::Animal\* \w+ @ rsi, int32_t \w+ @ rdx\)",
+                            v["caller_type"]), (name, "zoo::where signature", v["caller_type"])
     assert not any(f["kind"] == "slot returns two types" for f in rep["findings"]), (name, rep["findings"])
 
 
