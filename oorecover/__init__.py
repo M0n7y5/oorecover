@@ -129,17 +129,26 @@ _DECOMPILE_FILE = os.path.join(_TESTS, "decompile.txt")
 
 def decompile_text(bv, start):
     """The function's Pseudo C as the linear view renders it: the signature
-    line and the body, one string."""
+    line and the body, one string. The language representation is produced
+    asynchronously; on a large database the first render says Loading..., so
+    HLIL is forced first and the render retried, bounded."""
     func = bv.get_function_at(start)
     if func is None:
         return "no function at 0x%x" % start
-    cursor = LinearViewCursor(LinearViewObject.single_function_language_representation(func))
-    lines = []
-    while True:
-        chunk = bv.get_next_linear_disassembly_lines(cursor)
-        if not chunk:
+    func.hlil
+    for attempt in range(20):
+        cursor = LinearViewCursor(LinearViewObject.single_function_language_representation(func))
+        lines = []
+        while True:
+            chunk = bv.get_next_linear_disassembly_lines(cursor)
+            if not chunk:
+                break
+            lines.extend(str(line) for line in chunk)
+        if not any(line.strip() == "Loading..." for line in lines):
             break
-        lines.extend(str(line) for line in chunk)
+        if attempt == 10:
+            bv.update_analysis_and_wait()
+        time.sleep(0.5)
     return "\n".join(lines)
 
 
