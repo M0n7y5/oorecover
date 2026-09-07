@@ -125,6 +125,17 @@ public:
     int lives;
 };
 
+// Derives from a class with a virtual base: g++ emits a construction vtable
+// for Cat-in-Lion and a VTT for Lion.
+class Lion : public Cat {
+public:
+    Lion() { mane = 2; }
+    ~Lion() override { g_naps += mane; }   // a side effect keeps --icf from folding it into Cat's
+    int speak() override { return age + lives + mane; }
+    int legs() override { return 4 + mane; }
+    int mane;
+};
+
 }
 
 #ifdef _MSC_VER
@@ -217,11 +228,14 @@ int main() {
     heap->age = 7;
     int hs = heap->speak();
     zoo::Cat* cat = new zoo::Cat;
+    zoo::Lion lion;
+    lion.age = 6;
+    lion.lives = 1;
     cat->lives = 9;
     cat->age = 2;
     zoo::Info inf = heap->info();
     zoo::Info inf2 = heap->info2(2, 3);
-    r0 = labels(&an, heap, &p);
+    r0 = labels(&an, heap, &p) + use(&lion);
     int r = r0 + use(&an) + use(&d) + use(&b) + use(heap) + use(cat) + measure(&sq) + w.span + hs + an.describe() + an.rate(3) + heap->rate(2) + g_beacon.ping() + (int)inf.v[3] + (int)inf2.v[1];
     zoo::Stats st(r);
     zoo::Counter ct;

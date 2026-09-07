@@ -102,6 +102,8 @@ def _scan_with(bv, mem, abi, log, progress=None, cancelled=None):
         info = found[ap]
         info.referenced = info.has_rtti or _has_code_ref(bv, ap)
         tables.append(info)
+    if hasattr(abi, "mark_construction_tables"):
+        abi.mark_construction_tables(tables, log)
     return tables
 
 
@@ -123,7 +125,8 @@ def scan_vtables(bv, mem, log=print, progress=None, cancelled=None):
         % (abi.name, len(tables), with_rtti,
            sum(1 for t in tables if not t.has_rtti and t.referenced)))
     for t in tables[:60]:
-        log("[oorecover]   table %#x offset %d slots %d unresolved %d %s"
+        log("[oorecover]   table %#x offset %d slots %d unresolved %d %s%s"
             % (t.address, t.object_offset, len(t.slots), len(t.unresolved),
-               t.rtti_name or ("referenced" if t.referenced else "provisional")))
+               t.rtti_name or ("referenced" if t.referenced else "provisional"),
+               " (construction vtable in %s)" % t.construction if t.construction else ""))
     return abi, tables

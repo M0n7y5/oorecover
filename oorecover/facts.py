@@ -31,6 +31,7 @@ class VtableInfo:
     referenced: bool = False   # RTTI-backed or directly referenced from code
     sym_addr: Optional[int] = None  # the vtable symbol this table belongs to
     sym_name: Optional[str] = None  # class name decoded from that symbol
+    construction: Optional[str] = None  # derived class whose constructors use this construction vtable
 
     @property
     def functions(self):

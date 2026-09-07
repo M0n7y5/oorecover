@@ -257,10 +257,40 @@ def check_struct_returns(name, rep):
     where = [v for v in rep["vcalls"] if v["caller_name"] == "_ZN3zoo5whereEPNS_6AnimalEi"]
     assert where, (name, "zoo::where's virtual call unresolved")
     for v in where:
-        assert v["class"] == "zoo::Animal" and v["target_names"] == ["_ZN3zoo6Animal4legsEv"], (name, "zoo::where site", v)
+        assert v["class"] == "zoo::Animal" and "_ZN3zoo6Animal4legsEv" in v["target_names"], (name, "zoo::where site", v)
         assert re.fullmatch(r"struct zoo::where_result\(struct zoo::Animal\* \w+ @ rsi, int32_t \w+ @ rdx\)",
                             v["caller_type"]), (name, "zoo::where signature", v["caller_type"])
     assert not any(f["kind"] == "slot returns two types" for f in rep["findings"]), (name, rep["findings"])
+
+
+def check_construction(name, rep):
+    """Lion derives from Cat, which has Animal as a virtual base, so g++
+    emits a construction vtable for Cat-in-Lion: laid out like Cat's tables
+    and carrying Cat's typeinfo, it must neither pass for Cat's own table
+    nor found a class, and it is recorded on Cat under Lion's name."""
+    if rep["abi"] != "itanium":
+        return
+    cmap = {c["name"]: c for c in rep["classes"]}
+    by_addr = {t["address"]: c["name"] for c in rep["classes"] for t in c["vtables"].values()}
+    if name in NORTTI_FIXTURES or name in NAMED_NORTTI_FIXTURES:
+        # Without typeinfo the construction vtable's tables are provisional
+        # and dropped (nothing in code installs them directly), so no class
+        # can come from them; Lion's bases then read from its inlined
+        # constructors, as for every class of these fixtures.
+        assert not any(c["name"].startswith("class_") for c in rep["classes"]) or name in NORTTI_FIXTURES, \
+            (name, [c["name"] for c in rep["classes"]])
+        return
+    lion, cat = cmap.get("zoo::Lion"), cmap.get("zoo::Cat")
+    assert lion is not None and cat is not None, (name, "Lion or Cat missing", sorted(cmap))
+    assert base_map(lion).get("zoo::Cat", {}).get("offset") == 0, (name, lion["bases"])
+    assert base_map(cat).get("zoo::Animal", {}).get("virtual") is True, (name, cat["bases"])
+    ctor = cat["construction_vtables"].get("zoo::Lion")
+    assert ctor and "0" in ctor, (name, "construction vtable for Cat-in-Lion not recorded", cat["construction_vtables"])
+    for addr in ctor.values():
+        assert addr not in by_addr, (name, "construction vtable claimed as a class table", addr, by_addr[addr])
+        final = rep["final"]["tables"].get(addr)
+        assert final and final["type"] and "zoo::Cat::VTable" in final["type"], (name, addr, final)
+    assert len(cat["vtables"]) == 2, (name, "Cat's own tables", cat["vtables"])
 
 
 def check_puppy(name, rep):
@@ -428,6 +458,7 @@ def main(argv):
             check_namespaces(name, load(name))
             check_puppy(name, load(name))
             check_struct_returns(name, load(name))
+            check_construction(name, load(name))
             print("ok  ", name)
         except AssertionError as e:
             failed += 1

@@ -14,6 +14,7 @@ from binaryninja import MediumLevelILInstruction
 from binaryninja import MediumLevelILOperation as Op
 from binaryninja.enums import RegisterValueType, SymbolType, TypeClass, VariableSourceType
 
+from .abi import sign
 from .facts import AllocCall, ArgPass, MemberAccess, ThisCall, VirtualCall, VtableInstall
 from .names import hidden_this, mangled, member, member_class, scan_scopes, symbol_role
 
@@ -292,6 +293,9 @@ def _decompose(expr):
                 expr = right
             else:
                 return None
+            # Binary Ninja hands a 32-bit displacement over unsigned; a thunk's
+            # this minus its base offset must not read as a huge extent.
+            c = sign(c, expr.size * 8) if expr.size else c
             offset += c if op == Op.MLIL_ADD else -c
             continue
         return None

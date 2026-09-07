@@ -47,6 +47,8 @@ def build_report(bv, result):
             "thunks": {"%#x" % fn: off for fn, off in sorted(c.thunks.items())},
             "shared": {"%#x" % fn: slot for fn, slot in sorted(c.shared.items())},
             "embedded": {str(off): name for off, name in sorted(c.embedded.items())},
+            "construction_vtables": {derived: {str(off): "%#x" % t.address for off, t in sorted(tabs.items())}
+                                     for derived, tabs in sorted(c.construction.items())},
             "members": {str(off): list(m) for off, m in sorted(c.members.items())},
             "size": c.size,
             "sites": c.sites,

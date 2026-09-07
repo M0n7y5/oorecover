@@ -17,7 +17,7 @@ from binaryninja.enums import SymbolType
 
 from .abi import read_slots, sign
 from .facts import BaseRef, VtableInfo
-from .names import demangle
+from .names import _skip_group, _skip_ident, demangle
 
 MAX_SLOTS = 4096
 MAX_BASES = 64
@@ -273,14 +273,6 @@ class Itanium:
         self._ti_cache[ti] = result
         return result
 
-    def _in_construction_vtable(self, ap):
-        try:
-            dv = self.bv.get_data_var_at(ap)
-            sym = dv.symbol if dv is not None else None
-            return sym is not None and sym.raw_name.startswith("_ZTC")
-        except Exception:
-            return False
-
     def parse_vtable_at(self, ap, why=None, trusted=False, bound=None):
         p = self.mem.ptrsize
         ott = self.mem.read_int(ap - 2 * p, p)
@@ -296,8 +288,6 @@ class Itanium:
             parsed = self.parse_typeinfo(ti_ptr)
             if parsed is None:
                 return _fail(why, "typeinfo %#x unparsable" % ti_ptr)
-            if self._in_construction_vtable(ap):
-                return _fail(why, "inside a construction vtable")
             name, bases = parsed
         # A vtable symbol vouches for the address point, so null slots read as
         # slots there too: abstract classes carry null destructor slots.
@@ -311,6 +301,93 @@ class Itanium:
                           typeinfo_addr=ti_ptr if ti_ptr else None,
                           object_offset=-ott, rtti_name=name,
                           bases=list(bases), unresolved=unresolved)
+
+    def mark_construction_tables(self, tables, log=print):
+        """Flag construction vtables: the tables a derived class D's
+        constructors install while building a base T with virtual bases,
+        laid out like T's own tables and carrying T's typeinfo, so they
+        would pass for a second copy of T. Evidence, in order: a _ZTC
+        symbol covering the table; a _ZTT symbol whose entries list the
+        address point after D's own primary; without symbols, a VTT found
+        by its shape, a run of pointers to known address points that starts
+        with a primary of D and lists a primary of a base of D. Sets
+        VtableInfo.construction to D's name."""
+        p = self.mem.ptrsize
+        by_ap = {t.address: t for t in tables}
+        ti_name = {t.typeinfo_addr: t.rtti_name for t in tables if t.has_rtti}
+        marked = {}
+
+        def mark(t, derived, how):
+            if t.construction is None:
+                t.construction = derived
+                marked[t.address] = how
+
+        def vtt_entries(addr):
+            out = []
+            while True:
+                val = self.mem.read_ptr(addr)
+                if val is None or val not in by_ap:
+                    return out
+                out.append(by_ap[val])
+                addr += p
+
+        def mark_vtt(entries, derived, how):
+            # The first entry is D's own primary; the primary tables that
+            # follow with another class's typeinfo are construction vtables,
+            # and the entries sharing that typeinfo at other offsets are
+            # their secondaries.
+            own = entries[0]
+            ctor_tis = set()
+            for t in entries[1:]:
+                if t.has_rtti and t.typeinfo_addr != own.typeinfo_addr:
+                    if t.object_offset == 0:
+                        ctor_tis.add(t.typeinfo_addr)
+                    if t.typeinfo_addr in ctor_tis:
+                        mark(t, derived, how)
+
+        data_syms = sorted((s.address, s.raw_name) for s in self.bv.get_symbols()
+                           if s.type == SymbolType.DataSymbol)
+        for i, (addr, raw) in enumerate(data_syms):
+            if raw.startswith("_ZTC"):
+                end = data_syms[i + 1][0] if i + 1 < len(data_syms) else addr + MAX_SLOTS * p
+                for t in tables:
+                    if t.has_rtti and addr <= t.address - 2 * p < end:
+                        mark(t, self._ztc_derived(raw), "_ZTC symbol")
+            elif raw.startswith("_ZTT"):
+                entries = vtt_entries(addr)
+                if len(entries) >= 2:
+                    mark_vtt(entries, demangle_name(self.bv, raw[4:]), "_ZTT symbol")
+        seen = set()
+        for t in tables:
+            for ref in self.bv.get_data_refs(t.address):
+                if ref in seen or not self.mem.is_data(ref):
+                    continue
+                seen.add(ref)
+                entries = vtt_entries(ref)
+                if len(entries) < 2 or self.mem.read_ptr(ref - p) in by_ap:
+                    continue
+                own = entries[0]
+                if not own.has_rtti or own.object_offset != 0:
+                    continue
+                base_tis = {b.typeinfo for b in own.bases}
+                if any(e.has_rtti and e.object_offset == 0 and e.typeinfo_addr in base_tis
+                       for e in entries[1:]):
+                    mark_vtt(entries, own.rtti_name, "VTT shape")
+        if marked:
+            hows = sorted(set(marked.values()))
+            log("[oorecover] %d construction vtables (%s)" % (len(marked), ", ".join(
+                "%d by %s" % (sum(1 for h in marked.values() if h == how), how) for how in hows)))
+        return marked
+
+    def _ztc_derived(self, raw):
+        """D of _ZTC<D><offset>_<T>: the derived class the construction
+        vtable belongs to, a nested name or a plain length-prefixed one."""
+        body = raw[4:]
+        if body.startswith("N"):
+            end = _skip_group(body, 0)
+        else:
+            end = _skip_ident(body, 0)
+        return demangle_name(self.bv, body[:end])
 
     def symbol_candidates(self):
         p = self.mem.ptrsize

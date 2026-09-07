@@ -27,7 +27,7 @@ from . import validate
 class ClassModel:
     __slots__ = ("name", "typeinfo", "has_rtti", "vtables", "methods", "thunks",
                  "ctors", "dtors", "members", "bases", "size", "sites", "plain", "shared",
-                 "embedded", "site_functions")
+                 "embedded", "site_functions", "construction")
 
     def __init__(self, name, typeinfo=None, plain=False):
         self.name = name
@@ -43,6 +43,7 @@ class ClassModel:
         self.dtors = set()
         self.members = {}      # offset -> [size, hint, writes, reads]
         self.embedded = {}     # offset -> class of a member object built there
+        self.construction = {} # derived class -> {offset: VtableInfo}: its construction vtables for this class
         self.bases = []        # [BaseRef]
         self.size = 0
         self.sites = 0         # construction sites seen
@@ -274,12 +275,20 @@ def build_model(bv, mem, tables, facts, log=print):
             out.append((k, group, next((t for t in group if t.object_offset == 0), group[0])))
         return out
 
+    # A construction vtable carries the typeinfo of the class it lays out
+    # but belongs to the derived class's constructors: it neither owns a
+    # class nor votes for one, and is recorded on the class it lays out.
+    construction = [t for t in tables if t.construction]
+    tables = [t for t in tables if not t.construction]
     for ti, group, primary in group_by(lambda t: t.typeinfo_addr if t.has_rtti else None):
         cls = ClassModel(unique(primary.rtti_name or "class_%x" % primary.address,
                                 primary.address), ti)
         cls.bases = [BaseRef(b.name, b.offset, b.virtual, b.typeinfo) for b in primary.bases]
         offsets = {b.offset for b in cls.bases if b.offset is not None}
         add_group(cls, group, None if any(b.virtual for b in cls.bases) else offsets)
+        for t in construction:
+            if t.typeinfo_addr == ti:
+                cls.construction.setdefault(t.construction, {})[t.object_offset] = t
 
     for _sym, group, primary in group_by(
             lambda t: t.sym_addr if not t.has_rtti and t.sym_name else None):

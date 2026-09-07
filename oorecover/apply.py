@@ -620,6 +620,7 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
     maps methods returning a struct by value to the class of that struct."""
     result_types = result_types or {}
     replaced = set()    # <Class>::<method>_result placeholders superseded by a real struct
+    construction_typed = 0
     arch = bv.arch
     ptrsize = bv.address_size
     void_ptr = Type.pointer(arch, Type.void())
@@ -835,6 +836,27 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                 except Exception as e:
                     failures += 1
                     log("[oorecover] vtable var %s failed: %s" % (sym_name, e))
+                # A construction vtable for this class in a derived one has
+                # this class's slots, sub-table by sub-table (the virtual
+                # bases sit at the derived class's offsets): the same VTable
+                # struct, named for the constructors that install it.
+                rank = sorted(cls.vtables).index(off)
+                for derived, tabs in sorted(cls.construction.items()):
+                    ordered = [tabs[o] for o in sorted(tabs)]
+                    if rank >= len(ordered):
+                        continue
+                    ct = ordered[rank]
+                    sym_name = "%s::VTable_ctor_%s" % (derived, _short(cls.name)) + (
+                        "" if ct.object_offset == 0 else "_%x" % ct.object_offset)
+                    try:
+                        bv.define_user_data_var(
+                            ct.address, Type.named_type_from_registered_type(bv, flat(vt_name)))
+                        if bv.get_symbol_at(ct.address) is None:
+                            bv.define_user_symbol(Symbol(SymbolType.DataSymbol, ct.address, sym_name))
+                        construction_typed += 1
+                    except Exception as e:
+                        failures += 1
+                        log("[oorecover] construction vtable var %s failed: %s" % (sym_name, e))
         for name in sorted(stale | replaced):
             try:
                 bv.undefine_user_type(qualified(name))
@@ -874,9 +896,9 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
         bv.commit_undo_actions(undo)
     log("[oorecover] applied %d class types (%d failures, %d functions gained a this parameter, "
         "%d signatures repaired from mangled names, %d mismatches kept, %d signatures retyped, "
-        "%d left as they were, %d types unchanged, %d struct returns typed, %d placeholders replaced); "
-        "apply %.1fs, reanalysis %.1fs"
+        "%d left as they were, %d types unchanged, %d struct returns typed, %d placeholders replaced, "
+        "%d construction vtables typed); apply %.1fs, reanalysis %.1fs"
         % (len(defined), failures, newly_typed, repaired, kept, len(changed.starts), changed.identical,
-           changed.identical_types, len(result_types), len(replaced), t_apply - t_start,
-           t_reanalysis - t_apply))
+           changed.identical_types, len(result_types), len(replaced), construction_typed,
+           t_apply - t_start, t_reanalysis - t_apply))
     return newly_typed + namespaces
