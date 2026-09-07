@@ -77,7 +77,8 @@ def trace_functions(bv, starts, log=print, callers=False):
             [(hex(i.insn), hex(i.vtable), i.root, i.offset) for i in ff.installs][:8]))
 
 
-def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_names=()):
+def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_names=(),
+        reuse=None, changed=(), changed_types=()):
     cancelled = cancelled or (lambda: False)
     if progress:
         progress("waiting for analysis")
@@ -101,7 +102,7 @@ def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_
         mem = Memory(bv)
     t2 = time.time()
     facts = collect_all(bv, mem, abi, tables, log, progress, cancelled, extra_functions,
-                        class_names)
+                        class_names, reuse, changed, changed_types)
     if cancelled():
         return None
     t3 = time.time()
@@ -149,8 +150,11 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
     extra = set()
     class_names = set()
     earlier = []
+    reuse = None
+    retyped = set()
+    retyped_types = set()
     for n in range(2):
-        result = run(bv, log, progress, cancelled, extra, class_names)
+        result = run(bv, log, progress, cancelled, extra, class_names, reuse, retyped, retyped_types)
         if result is None:
             log("[oorecover] cancelled")
             return None
@@ -159,9 +163,11 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
         if not result.classes:
             log("[oorecover] no classes found")
             return result
+        retyped = set()
+        retyped_types = set()
         newly_typed = apply_model(bv, result.classes, log, progress, result.vcalls, result.abi,
                                   result.param_classes, result.facts, result.unowned,
-                                  result.instances)
+                                  result.instances, retyped, retyped_types)
         if len(result.tables) <= 16:
             final = vtable_snapshot(bv, result.tables)
             for addr, info in sorted(final["tables"].items()):
@@ -182,6 +188,9 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
         if n == 1:
             log("[oorecover] pass 2 done; %d functions discovered late, not visited" % (len(extra) - before))
             break
-        log("[oorecover] pass %d retyped %d parameterless functions, %d new functions to visit; rerunning"
-            % (n + 1, newly_typed, len(extra) - before))
+        reuse = result.facts
+        log("[oorecover] pass %d retyped %d parameterless functions, %d signatures and %d types changed, "
+            "%d new functions to visit; rerunning on the changed functions and their callers, "
+            "reusing the other facts" % (n + 1, newly_typed, len(retyped), len(retyped_types),
+                                         len(extra) - before))
     return result

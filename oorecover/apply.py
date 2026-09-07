@@ -159,6 +159,16 @@ def type_members(bv, name):
         return {"width": t.width, "members": None}
 
 
+def _same_struct(existing, sb):
+    """True when the existing structure has the builder's width and members."""
+    try:
+        return (existing.type_class == TypeClass.StructureTypeClass and existing.width == sb.width
+                and [(m.offset, m.name, str(m.type)) for m in existing.members]
+                == [(m.offset, m.name, str(m.type)) for m in sb.members])
+    except Exception:
+        return False
+
+
 def _own_types(bv):
     return _own_metadata(bv, _META_KEY)
 
@@ -326,6 +336,27 @@ class _Names:
         return name
 
 
+class _Retyped:
+    """Functions whose user type this run set and class types it defined,
+    with how many of each it left alone because the new one is identical
+    (6.0 already types most members from their names; a re-run finds its
+    own types). A return location does not print, so a struct return is
+    always applied."""
+    def __init__(self):
+        self.starts = set()
+        self.identical = 0
+        self.types = set()
+        self.identical_types = 0
+
+    def __call__(self, func, ftype, new_type, force=False):
+        if not force and str(new_type) == str(ftype):
+            self.identical += 1
+            return False
+        func.set_user_type(new_type)
+        self.starts.add(func.start)
+        return True
+
+
 MAX_VCALL_TARGETS = 32
 
 
@@ -367,7 +398,7 @@ def _declared_shift(bv, func):
     return 0
 
 
-def apply_namespace_functions(bv, log=print):
+def apply_namespace_functions(bv, retyped, log=print):
     """Binary Ninja 6.0 declares this on every Itanium function with a nested
     scope, namespace functions included, which shifts their real parameters
     one register to the right. A function whose scope has no class evidence
@@ -388,11 +419,11 @@ def apply_namespace_functions(bv, log=print):
             explicit = list(demangled[0].parameters)
             if explicit and explicit[0].name == "this":
                 explicit = explicit[1:]
-            func.set_user_type(Type.function(
-                _return_value(ftype), _default_locations(explicit),
-                calling_convention=ftype.calling_convention,
-                variable_arguments=ftype.has_variable_arguments))
-            repaired += 1
+            if retyped(func, ftype, Type.function(
+                    _return_value(ftype), _default_locations(explicit),
+                    calling_convention=ftype.calling_convention,
+                    variable_arguments=ftype.has_variable_arguments)):
+                repaired += 1
         except Exception as e:
             log("[oorecover] namespace function %#x failed: %s" % (func.start, e))
     if repaired:
@@ -400,7 +431,7 @@ def apply_namespace_functions(bv, log=print):
     return repaired
 
 
-def apply_member_this(bv, facts, class_names, claimed, log=print):
+def apply_member_this(bv, facts, class_names, claimed, retyped, log=print):
     """Insert the implicit this into demangled member signatures of recovered
     classes for functions no class owns (non-virtual methods), where the
     function reads the this register. Call sites then carry the object, so
@@ -420,11 +451,11 @@ def apply_member_this(bv, facts, class_names, claimed, log=print):
             cls_name = member_class(bv, func)
             if cls_name not in class_names:
                 continue
-            func.set_user_type(Type.function(
-                _return_value(ftype), [FunctionParameter(_named_ptr(bv, cls_name), "this")] + params,
-                calling_convention=ftype.calling_convention,
-                variable_arguments=ftype.has_variable_arguments))
-            inserted += 1
+            if retyped(func, ftype, Type.function(
+                    _return_value(ftype), [FunctionParameter(_named_ptr(bv, cls_name), "this")] + params,
+                    calling_convention=ftype.calling_convention,
+                    variable_arguments=ftype.has_variable_arguments)):
+                inserted += 1
         except Exception as e:
             log("[oorecover] member this %#x failed: %s" % (faddr, e))
     if inserted:
@@ -432,7 +463,7 @@ def apply_member_this(bv, facts, class_names, claimed, log=print):
     return inserted
 
 
-def apply_unowned(bv, unowned, log=print):
+def apply_unowned(bv, unowned, retyped, log=print):
     """An implementation shared by unrelated classes serves objects of all of
     them, so its this is a void pointer. Said explicitly, because Binary Ninja
     otherwise propagates whichever class's vtable slot type it meets first."""
@@ -453,17 +484,17 @@ def apply_unowned(bv, unowned, log=print):
                 params.insert(0, this)   # a pre-6.0 demangled member signature omits this
             else:
                 continue
-            func.set_user_type(Type.function(
-                _return_value(ftype), params, calling_convention=ftype.calling_convention,
-                variable_arguments=ftype.has_variable_arguments))
-            typed += 1
+            if retyped(func, ftype, Type.function(
+                    _return_value(ftype), params, calling_convention=ftype.calling_convention,
+                    variable_arguments=ftype.has_variable_arguments)):
+                typed += 1
         except Exception as e:
             log("[oorecover] shared this %#x failed: %s" % (faddr, e))
     if typed:
         log("[oorecover] %d shared implementations given a void this" % typed)
 
 
-def apply_param_types(bv, param_classes, claimed, class_names, log=print):
+def apply_param_types(bv, param_classes, claimed, class_names, retyped, log=print):
     """Type parameters that callers only ever pass known-class objects to,
     on functions no class owns. Existing struct pointer types are kept. A
     member function whose signature lacks this gets it inserted, typed by
@@ -502,10 +533,10 @@ def apply_param_types(bv, param_classes, claimed, class_names, log=print):
                 changed = True
             if not changed:
                 continue
-            func.set_user_type(Type.function(
-                _return_value(ftype), params, calling_convention=ftype.calling_convention,
-                variable_arguments=ftype.has_variable_arguments))
-            typed += 1
+            if retyped(func, ftype, Type.function(
+                    _return_value(ftype), params, calling_convention=ftype.calling_convention,
+                    variable_arguments=ftype.has_variable_arguments)):
+                typed += 1
         except Exception as e:
             log("[oorecover] param type %#x failed: %s" % (faddr, e))
     if typed:
@@ -536,7 +567,10 @@ def apply_instances(bv, instances, defined, log=print):
 
 
 def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium", param_classes=None,
-                facts=None, unowned=(), instances=None):
+                facts=None, unowned=(), instances=None, retyped=None, retyped_types=None):
+    """Define the recovered types and signatures. retyped and retyped_types,
+    when given, receive the starts of every function whose signature changed
+    and the names of every class type defined or redefined."""
     arch = bv.arch
     ptrsize = bv.address_size
     void_ptr = Type.pointer(arch, Type.void())
@@ -547,6 +581,7 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
     defined = set()
     failures = 0
     newly_typed = 0
+    changed = _Retyped()
     repaired = 0
     kept = 0
     stale = {n for n in own
@@ -618,7 +653,12 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                 sb.insert(off, _member_type(bv, size, hint), "m_%x" % off)
                 prev_end = off + size
             try:
-                bv.define_user_type(qualified(cls.name), Type.structure_type(sb))
+                new_struct = Type.structure_type(sb)
+                if existing is not None and _same_struct(existing, sb):
+                    changed.identical_types += 1
+                else:
+                    bv.define_user_type(qualified(cls.name), new_struct)
+                    changed.types.add(cls.name)
                 own.add(cls.name)
                 defined.add(cls.name)
             except Exception as e:
@@ -708,7 +748,7 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                         ret, lead + rest,
                         calling_convention=ftype.calling_convention,
                         variable_arguments=ftype.has_variable_arguments)
-                    func.set_user_type(new_type)
+                    changed(func, ftype, new_type, force=sret)
                 except Exception as e:
                     failures += 1
                     log("[oorecover] method %#x failed: %s" % (fn, e))
@@ -756,14 +796,18 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
         # names only one of them, so it gets no this from that name either.
         claimed = {fn for cls in order for fn in cls.owns()} | {fn for cls in order for fn in cls.thunks} \
             | {fn for cls in order for fn in cls.shared} | set(unowned)
-        namespaces = apply_namespace_functions(bv, log)
+        namespaces = apply_namespace_functions(bv, changed, log)
         if facts:
-            newly_typed += apply_member_this(bv, facts, set(by_name), claimed, log)
-        apply_unowned(bv, unowned, log)
+            newly_typed += apply_member_this(bv, facts, set(by_name), claimed, changed, log)
+        apply_unowned(bv, unowned, changed, log)
         if instances:
             apply_instances(bv, instances, defined, log)
         if param_classes:
-            apply_param_types(bv, param_classes, claimed, set(by_name), log)
+            apply_param_types(bv, param_classes, claimed, set(by_name), changed, log)
+        if retyped is not None:
+            retyped.update(changed.starts)
+        if retyped_types is not None:
+            retyped_types.update(changed.types)
         bv.store_metadata(_META_KEY, sorted(own))
         bv.store_metadata(_NAMES_KEY, sorted(own_functions))
         t_apply = time.time()
@@ -777,6 +821,8 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
     finally:
         bv.commit_undo_actions(undo)
     log("[oorecover] applied %d class types (%d failures, %d functions gained a this parameter, "
-        "%d signatures repaired from mangled names, %d mismatches kept); apply %.1fs, reanalysis %.1fs"
-        % (len(defined), failures, newly_typed, repaired, kept, t_apply - t_start, t_reanalysis - t_apply))
+        "%d signatures repaired from mangled names, %d mismatches kept, %d signatures retyped, "
+        "%d left as they were, %d types unchanged); apply %.1fs, reanalysis %.1fs"
+        % (len(defined), failures, newly_typed, repaired, kept, len(changed.starts), changed.identical,
+           changed.identical_types, t_apply - t_start, t_reanalysis - t_apply))
     return newly_typed + namespaces

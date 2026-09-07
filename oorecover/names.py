@@ -111,7 +111,8 @@ def scan_scopes(bv, class_names=(), log=print):
     destructor or cv-qualified member symbol (only members carry const), a
     demangled signature mentioning it as a parameter or return type (a
     namespace never is), or a structure type in the view that no run of ours
-    created. Cached per view; returns ({function start: scope}, classes)."""
+    created. Cached per view; returns ({function start: scope}, classes,
+    functions whose scope flipped since the previous scan of the view)."""
     global _SCOPES
     t0 = time.time()
     by_start = {}
@@ -159,13 +160,18 @@ def scan_scopes(bv, class_names=(), log=print):
         if t is not None and t.type_class == TypeClass.StructureTypeClass and t.width > 0:
             classes.add(scope)
     classes = frozenset(classes)
+    cached, _old_starts, old = _SCOPES
+    flipped = set()
+    if cached is bv:
+        flipped = {start for start, scope in by_start.items()
+                   if scope is not None and (scope in classes) != (scope in old)}
     _SCOPES = (bv, by_start, classes)
     members = sum(1 for s in by_start.values() if s in classes)
     nested = sum(1 for s in by_start.values() if s is not None)
     log("[oorecover] %d functions are class members by name, %d are in namespaces "
         "(%d of %d scopes have class evidence, %.1fs)"
         % (members, nested - members, len(scopes & classes), len(scopes), time.time() - t0))
-    return by_start, classes
+    return by_start, classes, flipped
 
 
 def member_class(bv, func):
@@ -178,7 +184,7 @@ def member_class(bv, func):
         return mangled_class(bv, func)
     cached, by_start, classes = _SCOPES
     if cached is not bv:
-        by_start, classes = scan_scopes(bv)
+        by_start, classes, _flipped = scan_scopes(bv)
     scope = by_start[func.start] if func.start in by_start else mangled_class(bv, func)
     return scope if scope in classes else None
 

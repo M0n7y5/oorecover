@@ -31,6 +31,7 @@ _CALLS = (Op.MLIL_CALL_SSA, Op.MLIL_TAILCALL_SSA)
 _VCALL_SITES = _CALLS + (Op.MLIL_JUMP,)
 _LOADS = (Op.MLIL_LOAD_SSA, Op.MLIL_LOAD_STRUCT_SSA)
 _STORES = (Op.MLIL_STORE_SSA, Op.MLIL_STORE_STRUCT_SSA)
+_TIMES = {"il": 0.0, "vars": 0.0, "walk": 0.0, "alias": 0.0, "rest": 0.0}   # per pass, seconds
 
 
 class FunctionFacts:
@@ -122,7 +123,13 @@ def _returns_indirect(func):
     return loc is not None and loc.location.indirect
 
 
-def _this_keys(bv, func, ssa, sret=False):
+def _entry_vars(ssa):
+    """The SSA variables no instruction defines: the function's incoming
+    values, read once for the three parameter helpers below."""
+    return [sv for sv in ssa.ssa_vars if ssa.get_ssa_var_definition(sv) is None]
+
+
+def _this_keys(bv, func, entry, sret=False):
     """SSA keys of the incoming this-pointer: the parameter named this when
     the function type declares one, else the first parameter when the type
     has one, else the first integer argument register (or the first stack
@@ -147,17 +154,10 @@ def _this_keys(bv, func, ssa, sret=False):
             storage = _param_storage(func, 0)
         if storage is None:
             storage = _arg_storage(func, 0)
-    keys = []
-    for sv in ssa.ssa_vars:
-        if ssa.get_ssa_var_definition(sv) is not None:
-            continue
-        v = sv.var
-        if (v.source_type, v.storage) == storage:
-            keys.append(_key(sv))
-    return keys
+    return [_key(sv) for sv in entry if (sv.var.source_type, sv.var.storage) == storage]
 
 
-def _reads_entry_this(func, ssa):
+def _reads_entry_this(func, ssa, entry):
     """True when the function reads its incoming this: the declared this
     parameter, or the first integer argument register when the demangled
     signature omits this (static members never read it)."""
@@ -169,15 +169,14 @@ def _reads_entry_this(func, ssa):
         if cc is None or not list(cc.int_arg_regs):
             return False
         storage = _arg_storage(func, 0)
-    for sv in ssa.ssa_vars:
+    for sv in entry:
         v = sv.var
-        if ((v.source_type, v.storage) == storage
-                and ssa.get_ssa_var_definition(sv) is None and ssa.get_ssa_var_uses(sv)):
+        if (v.source_type, v.storage) == storage and ssa.get_ssa_var_uses(sv):
             return True
     return False
 
 
-def _param_keys(func, ssa, max_index):
+def _param_keys(func, entry, max_index):
     """{index: SSA keys} for parameters 1..max_index-1: the declared parameter
     variable, else the matching integer argument register."""
     params = list(func.parameter_vars)
@@ -193,9 +192,7 @@ def _param_keys(func, ssa, max_index):
     keys = {}
     if not by_var and not by_reg:
         return keys
-    for sv in ssa.ssa_vars:
-        if ssa.get_ssa_var_definition(sv) is not None:
-            continue
+    for sv in entry:
         v = sv.var
         index = by_var.get(v)
         if index is None and v.source_type == _REGISTER:
@@ -299,54 +296,71 @@ def _callee_param_types(bv, call):
     return types
 
 
-def _escaping_addresses(bv, root, addr_vars):
-    """Variables whose address is used other than as a load address or as an
-    argument the callee receives as pointer/reference to const: passed to a
-    callee that may write through it, stored, or kept beyond a plain copy.
-    addr_vars maps SSA keys holding &var to var."""
+_ADDRESS_OFS = (Op.MLIL_ADDRESS_OF, Op.MLIL_ADDRESS_OF_FIELD)
+
+
+def _scan(bv, root, addr_vars, spill_reads, escaping):
+    """One walk over an instruction's expressions, in _walk order. Records
+    aliased variable reads into spill_reads, and into escaping the variables
+    whose address is used other than as a load address or as an argument
+    the callee receives as pointer/reference to const: passed to a callee
+    that may write through it, stored, or kept beyond a plain copy
+    (addr_vars maps SSA keys holding &var to var). Returns the loads as
+    (expression, field offset), resolved once the alias map is complete,
+    and the stack variable reads."""
     def var_of(e):
         op = e.operation
-        if op in (Op.MLIL_ADDRESS_OF, Op.MLIL_ADDRESS_OF_FIELD):
+        if op in _ADDRESS_OFS:
             return e.src.identifier
         if op == Op.MLIL_VAR_SSA:
             return addr_vars.get(_key(e.src))
         return None
 
-    if root.operation in _SETS and root.src.operation in (Op.MLIL_ADDRESS_OF, Op.MLIL_ADDRESS_OF_FIELD):
-        return   # the copy itself; its uses are judged where they occur
-    if root.operation == Op.MLIL_VAR_PHI:
+    loads = []
+    stack_reads = []
+    op = root.operation
+    if op == Op.MLIL_VAR_PHI:
         for sv in root.src:
             var_id = addr_vars.get(_key(sv))
             if var_id is not None:
-                yield var_id
-        return
-    stack = [(root, False)]
+                escaping.add(var_id)
+        return loads, stack_reads
+    # The copy of an address itself does not escape; its uses are judged where they occur.
+    stack = [(root, False, not (op in _SETS and root.src.operation in _ADDRESS_OFS))]
     while stack:
-        e, under_load = stack.pop()
+        e, under_load, may_escape = stack.pop()
         op = e.operation
+        if op == Op.MLIL_VAR_ALIASED:
+            spill_reads.setdefault(e.src.var.identifier, set()).add(_key(e.src))
+        if op in _LOADS:
+            loads.append((e, e.offset if op == Op.MLIL_LOAD_STRUCT_SSA else 0))
+        elif op in (Op.MLIL_VAR_SSA, Op.MLIL_VAR_ALIASED) or op in _FIELD_VARS:
+            v = e.src.var
+            if v.source_type == _STACK:
+                field = e.offset if op in _FIELD_VARS else 0
+                stack_reads.append((e.address, v.storage + field, e.size, False))
         var_id = var_of(e)
         if var_id is not None:
-            if not under_load:
-                yield var_id
+            if may_escape and not under_load:
+                escaping.add(var_id)
             continue
-        if op in _CALLS:
+        kept = set()
+        if op in _CALLS and may_escape:
             ptypes = False
             for i, param in enumerate(e.params):
                 if var_of(param) is not None:
                     if ptypes is False:
                         ptypes = _callee_param_types(bv, e)
                     if ptypes is not None and i < len(ptypes) and _const_pointee(ptypes[i]):
-                        continue
-                stack.append((param, False))
-            stack.append((e.dest, False))
-            continue
+                        kept.add(param.expr_index)
         child_under_load = under_load if op in (Op.MLIL_ADD, Op.MLIL_SUB) else op in _LOADS
         for operand in e.operands:
             if isinstance(operand, MediumLevelILInstruction):
-                stack.append((operand, child_under_load))
+                stack.append((operand, child_under_load, may_escape and operand.expr_index not in kept))
             elif isinstance(operand, list):
-                stack.extend((o, child_under_load) for o in operand
-                             if isinstance(o, MediumLevelILInstruction))
+                stack.extend((o, child_under_load, may_escape and o.expr_index not in kept)
+                             for o in operand if isinstance(o, MediumLevelILInstruction))
+    return loads, stack_reads
 
 
 def _call_target(bv, expr):
@@ -382,6 +396,7 @@ def _make_name_check(bv, names, short_prefix):
 
 def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, debug=None,
                      slot_functions=frozenset(), sret=False):
+    t0 = time.perf_counter()
     mlil = func.mlil
     if mlil is None:
         return None
@@ -390,6 +405,8 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
         return None
     facts = FunctionFacts(func.start)
     insns = [insn for bb in ssa.basic_blocks for insn in bb]
+    t1 = time.perf_counter()
+    _TIMES["il"] += t1 - t0
     if len(insns) <= MAX_THUNK_INSNS:
         # A thunk does nothing but jump: a small deleting destructor that
         # calls the base destructor and tail-calls operator delete is not one.
@@ -407,25 +424,32 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
         aliases[key] = (root, off)
         return True
 
-    for key in _this_keys(bv, func, ssa, sret):
+    entry = _entry_vars(ssa)
+    for key in _this_keys(bv, func, entry, sret):
         alias(key, ("this",), 0)
     if sret or _returns_indirect(func):
         facts.sret = True       # re-collected past the buffer, or typed so by an earlier pass
     pvars = list(func.parameter_vars)
     if pvars and pvars[0].name == "sret":
         facts.sret = True       # marking of releases before the native return location, kept one release
-    facts.entry_this = _reads_entry_this(func, ssa)
+    facts.entry_this = _reads_entry_this(func, ssa, entry)
     facts.member_of = member_class(bv, func)
-    for index, keys in _param_keys(func, ssa, MAX_PARAM_ROOTS).items():
+    for index, keys in _param_keys(func, entry, MAX_PARAM_ROOTS).items():
         for key in keys:
             alias(key, ("param", index), 0)
+    t2 = time.perf_counter()
+    _TIMES["vars"] += t2 - t1
 
     call_out = {}
-
+    targets = {}        # call instruction index -> direct target, looked up once
+    addr_vars = {}      # SSA key holding &var -> var
     for insn in insns:
-        if insn.operation not in _CALLS or not insn.params:
+        op = insn.operation
+        if op in _SETS and insn.src.operation in _ADDRESS_OFS:
+            addr_vars[_key(insn.dest)] = insn.src.src.identifier
+        if op not in _CALLS or not insn.params:
             continue
-        target = _call_target(bv, insn.dest)
+        target = targets[insn.instr_index] = _call_target(bv, insn.dest)
         size = _const(insn.params[0])
         if size is None or not 0 < size < MAX_ALLOC:
             continue
@@ -442,10 +466,7 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
     spill_writes = {}   # aliased variable -> keys of its SET_VAR_ALIASED writes
     spill_reads = {}    # aliased variable -> keys read (versioned by memory, so undefined in SSA)
     address_taken = set()
-    addr_vars = {}      # SSA key holding &var -> var
-    for insn in insns:
-        if insn.operation in _SETS and insn.src.operation in (Op.MLIL_ADDRESS_OF, Op.MLIL_ADDRESS_OF_FIELD):
-            addr_vars[_key(insn.dest)] = insn.src.src.identifier
+    scans = []          # per instruction: its loads and stack reads, in walk order
     for insn in insns:
         op = insn.operation
         if op in _SETS:
@@ -456,13 +477,12 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 spill_writes.setdefault(insn.dest.var.identifier, []).append(_key(insn.dest))
         elif op == Op.MLIL_VAR_PHI:
             phis.append((_key(insn.dest), [_key(s) for s in insn.src]))
-        for sub in _walk(insn):
-            if sub.operation == Op.MLIL_VAR_ALIASED:
-                spill_reads.setdefault(sub.src.var.identifier, set()).add(_key(sub.src))
-        address_taken.update(_escaping_addresses(bv, insn, addr_vars))
+        scans.append(_scan(bv, insn, addr_vars, spill_reads, address_taken))
         if op == Op.MLIL_SET_VAR_ALIASED_FIELD or op == Op.MLIL_VAR_ALIASED_FIELD:
             address_taken.add(insn.dest.var.identifier if op == Op.MLIL_SET_VAR_ALIASED_FIELD
                               else insn.src.var.identifier)
+    t3 = time.perf_counter()
+    _TIMES["walk"] += t3 - t2
 
     def propagate():
         for _ in range(MAX_PASSES):
@@ -512,10 +532,11 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
         return ("global", off), 0
 
     seeded = False
+    store_vals = {}     # store instruction index -> constant stored, from dataflow, computed once
     for insn in insns:
         if insn.operation not in _STORES:
             continue
-        val = _const(insn.src)
+        val = store_vals[insn.instr_index] = _const(insn.src)
         if val is None or val not in vtable_addrs:
             continue
         d = _decompose(insn.dest)
@@ -604,11 +625,13 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 changed = True
         if not changed:
             break
+    t4 = time.perf_counter()
+    _TIMES["alias"] += t4 - t3
 
     if debug is not None:
         print = debug
         print("[oorecover] debug %#x this keys %s params %s" % (
-            func.start, _this_keys(bv, func, ssa), _param_keys(func, ssa, MAX_PARAM_ROOTS)))
+            func.start, _this_keys(bv, func, entry), _param_keys(func, entry, MAX_PARAM_ROOTS)))
         print("[oorecover] debug %#x spill writes %s reads %s address_taken %s" % (
             func.start, spill_writes, {k: sorted(v) for k, v in spill_reads.items()}, address_taken))
         for insn in insns:
@@ -634,25 +657,19 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
 
     facts.reach = max([off for root, off in aliases.values() if root == ("this",)] + [0])
 
-    for insn in insns:
+    for insn, (loads, stack_reads) in zip(insns, scans):
         op = insn.operation
-        for sub in _walk(insn):
-            sop = sub.operation
-            if sop in _LOADS:
-                r = resolve_field(sub.src, sub.offset if sop == Op.MLIL_LOAD_STRUCT_SSA else 0)
-                if r is not None:
-                    facts.accesses.append(MemberAccess(
-                        func.start, sub.address, r[0], r[1], sub.size, False))
-            elif sop in (Op.MLIL_VAR_SSA, Op.MLIL_VAR_ALIASED) or sop in _FIELD_VARS:
-                v = sub.src.var
-                if v.source_type == _STACK:
-                    field = sub.offset if sop in _FIELD_VARS else 0
-                    facts.stack_accesses.append((sub.address, v.storage + field, sub.size, False))
+        for sub, field_offset in loads:
+            r = resolve_field(sub.src, field_offset)
+            if r is not None:
+                facts.accesses.append(MemberAccess(
+                    func.start, sub.address, r[0], r[1], sub.size, False))
+        facts.stack_accesses.extend(stack_reads)
         if op in _STORES:
             r = resolve_field(insn.dest, insn.offset if op == Op.MLIL_STORE_STRUCT_SSA else 0)
             if r is None:
                 continue
-            val = _const(insn.src)
+            val = store_vals[insn.instr_index]
             if val is not None and val in vtable_addrs:
                 facts.installs.append(VtableInstall(
                     func.start, insn.address, insn.instr_index, val, r[0], r[1]))
@@ -675,8 +692,10 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
             else:
                 facts.stack_accesses.append((insn.address, dv.storage + field, insn.size, True))
         elif op in _CALLS:
-            target = _call_target(bv, insn.dest)
-            if target is None or not insn.params or is_allocator(target):
+            if not insn.params:
+                continue
+            target = targets[insn.instr_index]
+            if target is None or is_allocator(target):
                 continue
             r = resolve(insn.params[0])
             if r is not None:
@@ -688,6 +707,7 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 r = resolve(param)
                 if r is not None and r[1] >= 0:
                     facts.argpasses.append(ArgPass(func.start, insn.address, target, index, r[0], r[1]))
+    _TIMES["rest"] += time.perf_counter() - t4
     if not sret and func.start in slot_functions and not facts.installs and any(
             a.root == ("this",) and a.offset == 0 and a.is_write for a in facts.accesses):
         # A virtual method never writes its own vtable slot: the register it
@@ -761,20 +781,61 @@ def _relevant_functions(bv, tables, is_allocator):
     return starts
 
 
+def _callers(bv, starts):
+    """Functions with a code reference to any of starts."""
+    out = set()
+    for start in starts:
+        for ref in bv.get_code_refs(start):
+            if ref.function is not None:
+                out.add(ref.function.start)
+    return out
+
+
+_SEEN = set()   # functions the previous collect_all visited, facts or not
+
+
 def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, extra=(),
-                class_names=()):
+                class_names=(), reuse=None, changed=(), changed_types=()):
+    """Facts per function. With reuse (the previous pass's facts) only the
+    functions whose facts can differ are collected again: those retyped
+    (changed), those taking a pointer to a class type defined or redefined
+    meanwhile (changed_types: the definition changes how their loads and
+    stores read), those whose scope gained or lost class evidence, the
+    callers of all of these (call sites carry arguments only once the callee
+    is typed), the construction sites in extra (the definitions retype their
+    objects) and functions not visited before; the rest keep their facts."""
+    global _SEEN
     _CALLEE_PARAMS.clear()
+    for phase in _TIMES:
+        _TIMES[phase] = 0.0
     is_allocator = _make_name_check(bv, abi.allocators, "operator new")
     is_deallocator = _make_name_check(bv, abi.deallocators, "operator delete")
     vtable_addrs = {t.address for t in tables}
     slot_functions = frozenset(fn for t in tables for fn in t.functions)
     class_names = {t.rtti_name for t in tables if t.rtti_name} | set(class_names or ())
-    scan_scopes(bv, class_names, log)
+    _by_start, _classes, flipped = scan_scopes(bv, class_names, log)
     debug_funcs = _debug_funcs()
-    pending = sorted(_relevant_functions(bv, tables, is_allocator) | set(extra)
-                     | _typed_param_functions(bv, class_names, log)
-                     | _member_functions(bv))
+    relevant = (_relevant_functions(bv, tables, is_allocator) | set(extra)
+                | _typed_param_functions(bv, class_names, log) | _member_functions(bv))
     result = {}
+    if reuse is None:
+        pending = sorted(relevant)
+    else:
+        retyped = (set(changed) | _typed_param_functions(bv, set(changed_types), log)) & relevant
+        flipped &= relevant
+        t0 = time.time()
+        callers = _callers(bv, retyped | flipped) & relevant
+        t_callers = time.time() - t0
+        new = relevant - _SEEN
+        todo = retyped | flipped | callers | (set(extra) & relevant) | new
+        pending = sorted(todo)
+        result = {addr: f for addr, f in reuse.items() if addr not in todo}
+        log("[oorecover] re-collecting %d of %d relevant functions (%d retyped or taking a redefined "
+            "type, %d scope flips, %d callers found in %.1fs, %d construction sites, %d new); "
+            "%d facts reused from the previous pass (a fresh database defines every type and retypes "
+            "most members; a database typed by an earlier run reuses most)"
+            % (len(pending), len(relevant), len(retyped), len(flipped), len(callers), t_callers,
+               len(set(extra) & relevant), len(new), len(result)))
     seen = set()
     no_il = 0
     failed = 0
@@ -807,6 +868,10 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
             pending.append(f.tail_target)
         if not f.empty():
             result[addr] = f
-    log("[oorecover] facts from %d of %d relevant functions (%d without IL, %d failed)"
+    log("[oorecover] facts from %d functions (%d visited now, %d without IL, %d failed)"
         % (len(result), total, no_il, failed))
+    log("[oorecover] collect time: IL %.1fs, entry vars %.1fs, instruction walk %.1fs, "
+        "alias and vtable propagation %.1fs, facts %.1fs"
+        % (_TIMES["il"], _TIMES["vars"], _TIMES["walk"], _TIMES["alias"], _TIMES["rest"]))
+    _SEEN = seen if reuse is None else _SEEN | seen
     return result
