@@ -6,6 +6,7 @@ Object roots used by collector facts:
   ("global", addr)    an absolute address
   ("stack", storage)  frame offset of a local object
   ("var", key)        unknown SSA variable seeded by a vtable store
+  ("member", root, off) the pointer loaded from that member of root (virtual calls only)
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -61,6 +62,7 @@ class MemberAccess:
     size: int
     is_write: bool
     hint: str = "int"          # "int" | "ptr"
+    src_root: tuple = None     # object root whose offset 0 a write stores; ("const", v) for a bare constant
 
 
 @dataclass

@@ -27,7 +27,7 @@ from . import validate
 class ClassModel:
     __slots__ = ("name", "typeinfo", "has_rtti", "vtables", "methods", "thunks",
                  "ctors", "dtors", "members", "bases", "size", "sites", "plain", "shared",
-                 "embedded", "site_functions", "construction", "nonvirtual")
+                 "embedded", "site_functions", "construction", "nonvirtual", "member_classes")
 
     def __init__(self, name, typeinfo=None, plain=False):
         self.name = name
@@ -43,6 +43,7 @@ class ClassModel:
         self.dtors = set()
         self.members = {}      # offset -> [size, hint, writes, reads]
         self.embedded = {}     # offset -> class of a member object built there
+        self.member_classes = {}   # offset -> class the pointer member there points to
         self.construction = {} # derived class -> {offset: VtableInfo}: its construction vtables for this class
         self.nonvirtual = set() # unnamed functions attributed by the objects callers pass as this
         self.bases = []        # [BaseRef]
@@ -135,6 +136,23 @@ def base_at(cls, off, by_name, depth=0):
         bc = by_name.get(b.name)
         if bc is not None and b.offset < off:
             inner = base_at(bc, off - b.offset, by_name, depth + 1)
+            if inner is not None:
+                return inner
+    return None
+
+
+def member_class_at(cls, off, by_name, depth=0):
+    """The class the pointer member at `off` in cls (or in a base holding
+    that offset) points to, else None."""
+    if depth > 32:
+        return None
+    name = cls.member_classes.get(off)
+    if name is not None:
+        return by_name.get(name)
+    for b in cls.bases:
+        bc = by_name.get(b.name)
+        if bc is not None and bc is not cls and b.offset is not None and b.offset <= off:
+            inner = member_class_at(bc, off - b.offset, by_name, depth + 1)
             if inner is not None:
                 return inner
     return None
@@ -679,7 +697,7 @@ def build_model(bv, mem, tables, facts, log=print):
     exact_keys = set()
     full = {}
     vcalls, param_classes = resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log,
-                                                  unowned, exact_keys, full)
+                                                  unowned, exact_keys, full, instances, ptrsize)
     attribute_nonvirtual(bv, classes, facts, claimed, full, exact_keys, by_name,
                          {fn for t in tables for fn in t.functions}, ptrsize, log)
     if len(vcalls) <= 12:
@@ -920,7 +938,7 @@ def base_offset_in(derived, base, by_name, depth=0):
 
 
 def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print, unowned=(),
-                          exact_keys=None, full=None):
+                          exact_keys=None, full=None, instances=None, ptrsize=8):
     """Resolve indirect calls through vtables to their implementations.
 
     Returns [(caller, insn, static class name, exact, [targets])]. A call
@@ -948,6 +966,28 @@ def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print
     site_class = {(faddr, root): cls for faddr, root, cls in sites}
     param_class = infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log,
                                       unowned, exact_keys)
+
+    def root_class(faddr, root):
+        """Static class of an object root in faddr: the owning class for
+        this, the class callers pass for a parameter, the class built at a
+        site, the static instance at a global, the typed member for a
+        member root; None when unknown."""
+        if root == ("this",) and faddr in claimed:
+            cls = claimed[faddr]
+            return None if faddr in cls.thunks else cls
+        if root == ("this",) or root[0] == "param":
+            return param_class.get((faddr, 0 if root == ("this",) else root[1]), (None,))[0]
+        if root[0] in ("alloc", "stack"):
+            return site_class.get((faddr, root))
+        if root[0] == "global":
+            return (instances or {}).get(root[1])
+        if root[0] == "member":
+            cls = root_class(faddr, root[1])
+            return member_class_at(cls, root[2], by_name) if cls is not None else None
+        return None
+
+    type_member_pointers(classes, facts, site_class, root_class, by_name, ptrsize, log)
+
     def targets_for(cls, vc, exact):
         table = cls.vtables.get(vc.object_offset)
         if table is None or vc.slot >= len(table.slots):
@@ -1003,6 +1043,10 @@ def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print
                     table = cls.vtables.get(vc.object_offset)
                     if table is None or vc.slot >= len(table.slots):
                         cls = alt
+            elif vc.root[0] == "member":
+                # The member's static type: the object it holds may be more derived.
+                cls = root_class(faddr, vc.root)
+                exact = False
             else:
                 continue
             if cls is None:
@@ -1020,6 +1064,65 @@ def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print
     if full is not None:
         full.update(param_class)
     return resolved, inferred
+
+
+def type_member_pointers(classes, facts, site_class, root_class, by_name, ptrsize, log=print):
+    """Type pointer-sized members by the objects stored into them. The
+    stores of a class's own functions through this and those at its
+    construction sites vote, together with the bases sharing the offset;
+    a member whose votes all name classes with a common ancestor points
+    to that ancestor. A store of an unknown object or of a global that is
+    no static instance says nothing; a store of a non-zero constant that
+    is no address contradicts."""
+    votes = {}    # (class name, offset) -> [class, or None for a constant]
+
+    def vote(cls, faddr, a):
+        if a.size != ptrsize or a.offset not in cls.members:
+            return
+        src = root_class(faddr, a.src_root)
+        if src is not None or a.src_root[0] == "const":
+            votes.setdefault((cls.name, a.offset), []).append(src)
+
+    for cls in classes:
+        for fn in cls.owns():
+            ff = facts.get(fn)
+            if ff is None or fn in cls.thunks:
+                continue
+            for a in ff.accesses:
+                if a.src_root is not None and a.root == ("this",):
+                    vote(cls, fn, a)
+    for (faddr, root), cls in site_class.items():
+        for a in facts[faddr].accesses:
+            if a.src_root is not None and a.root == root:
+                vote(cls, faddr, a)
+
+    def gather(cls, off, depth=0):
+        out = list(votes.get((cls.name, off), ()))
+        if depth > 32:
+            return out
+        for b in cls.bases:
+            bc = by_name.get(b.name)
+            if bc is not None and bc is not cls and b.offset is not None and b.offset <= off:
+                out += gather(bc, off - b.offset, depth + 1)
+        return out
+
+    typed = contradicted = 0
+    for cls in classes:
+        for off, m in cls.members.items():
+            if m[0] != ptrsize:
+                continue
+            cands = gather(cls, off)
+            if None in cands:
+                if any(c is not None for c in cands):
+                    contradicted += 1
+                continue
+            common = common_ancestor(cands, by_name) if cands else None
+            if common is not None:
+                cls.member_classes[off] = common.name
+                typed += 1
+    if typed or contradicted:
+        log("[oorecover] %d members typed as class pointers (%d contradicted by a constant store)"
+            % (typed, contradicted))
 
 
 def attribute_nonvirtual(bv, classes, facts, claimed, param_classes, exact_keys, by_name, slot_functions,

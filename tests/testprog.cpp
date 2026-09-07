@@ -187,6 +187,17 @@ class Counter {
 public:
     NOINLINE int bump(int by, Animal* a) { n += by + a->legs(); return n; }
 };
+
+// A pointer member: the constructor stores the Dog it builds into pet, which
+// types pet as Dog*, and noise() calls speak() through it. The virtual
+// destructor gives Kennel a vtable on every fixture.
+class Kennel {
+public:
+    NOINLINE Kennel() { pet = new Dog; }
+    virtual ~Kennel() { delete pet; }
+    NOINLINE int noise() { return pet->speak(); }
+    Animal* pet;
+};
 }
 zoo::Beacon g_beacon;
 
@@ -239,7 +250,8 @@ int main() {
     int r = r0 + use(&an) + use(&d) + use(&b) + use(heap) + use(cat) + measure(&sq) + w.span + hs + an.describe() + an.rate(3) + heap->rate(2) + g_beacon.ping() + (int)inf.v[3] + (int)inf2.v[1];
     zoo::Stats st(r);
     zoo::Counter ct;
-    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3) + p.play() + p.rest() + use(&p) + ct.bump(4, heap);
+    zoo::Kennel kn;
+    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3) + p.play() + p.rest() + use(&p) + ct.bump(4, heap) + kn.noise();
     delete heap;
     delete cat;
     return r;

@@ -295,12 +295,12 @@ def check_construction(name, rep):
 
 # Non-virtual members by address on the stripped copy of testprog (same
 # code layout), from testprog.json: Animal::rate reads age through its
-# object; Puppy::play and rest only call virtuals, as use() does, so they
-# stay unnamed; Stats and Counter exist only by symbol here.
-NONVIRTUAL = {"testprog_stripped": {"0x4021dc": "zoo::Animal"},
-              "testprog32": {"0x1120e": "zoo::Animal"},
-              "testprog_msvc64.exe": {"0x140001004": "zoo::Animal"},
-              "testprog_msvc32.exe": {"0x401004": "zoo::Animal"}}
+# object, Kennel::noise reads pet; Puppy::play and rest only call virtuals,
+# as use() does, so they stay unnamed; Stats and Counter exist only by symbol here.
+NONVIRTUAL = {"testprog_stripped": {"0x4021dc": "zoo::Animal", "0x402bc2": "zoo::Kennel"},
+              "testprog32": {"0x1120e": "zoo::Animal", "0x11d8a": "zoo::Kennel"},
+              "testprog_msvc64.exe": {"0x140001004": "zoo::Animal", "0x140001668": "zoo::Kennel"},
+              "testprog_msvc32.exe": {"0x401004": "zoo::Animal", "0x40153c": "zoo::Kennel"}}
 FREE_FUNCTIONS = {"testprog_stripped": ("0x40226a", "0x402294", "0x4022a3", "0x402321", "0x4022c7", "0x4022ed"),
                   "testprog32": ("0x112a8", "0x112cb", "0x112dc", "0x1135f", "0x1130a", "0x11330"),
                   # -O2: speculative devirtualisation inlines callee bodies under
@@ -356,6 +356,45 @@ def check_puppy(name, rep):
     fetch = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-2]]]
     kind = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-3]]]
     assert len(fetch) >= 2 and len(kind) >= 1, (name, "Puppy::play and rest sites to the last slots", fetch, kind)
+
+
+def check_kennel(name, rep):
+    """Kennel's constructor stores the Dog it builds into pet, at offset
+    ptrsize: the only class-pointer member in the fixture, typed with Dog
+    (by name wherever Dog has one, and always the class built at an
+    allocation site inside Kennel's constructor), and noise()'s call
+    through it resolves to Dog's speak slot, not exactly (pet may hold a
+    Puppy). The struct member reads struct Dog*. The MSVC fixtures inline
+    their own operator new, so no allocation roots an object there and
+    pet stays untyped; -O2 (testprog_o2, testprog_icf) knows pet holds a
+    Dog and devirtualises noise(), so only the destructor's delete calls
+    through the member there."""
+    p = rep["ptrsize"]
+    cmap = {c["name"]: c for c in rep["classes"]}
+    typed = [(c, off, m) for c in rep["classes"] for off, m in c["members"].items() if len(m) > 4]
+    if not any(s.endswith(" alloc") for c in rep["classes"] for s in c["site_functions"]):
+        assert not typed, (name, "class-pointer member without an allocation", typed)
+        return
+    assert len(typed) == 1, (name, "one class-pointer member expected", [(c["name"], off, m) for c, off, m in typed])
+    kennel, off, m = typed[0]
+    assert int(off) == p and m[0] == p, (name, "pet at offset ptrsize", off, m)
+    dog = cmap.get(m[4])
+    assert dog is not None, (name, "pointee class missing", m)
+    if "zoo::Dog" in cmap:
+        assert m[4] == "zoo::Dog" and kennel["name"] == "zoo::Kennel", (name, kennel["name"], m)
+    assert any(fn in kennel["ctors"] and kind == "alloc" for fn, kind in (s.split() for s in dog["site_functions"])), \
+        (name, "pet's Dog not built in Kennel's constructor", kennel["ctors"], dog["site_functions"])
+    assert member_names(kennel).get("m_%x" % p, [None] * 3)[2] == "struct %s*" % m[4], (name, member_names(kennel))
+    if name in ("testprog_o2",) + FOLDED_FIXTURES:
+        noise = [v for v in rep["vcalls"] if v["class"] == dog["name"] and not v["exact"]]
+        assert any(v["caller"] in kennel["dtors"] for v in noise), (name, "~Kennel's delete pet unresolved", noise)
+        return
+    speak = dog["vtables"]["0"]["slots"][2 if rep["abi"] == "itanium" else 1]
+    noise = [v for v in rep["vcalls"] if v["class"] == dog["name"] and not v["exact"]]
+    assert any(v["targets"] == [speak] for v in noise), (name, "noise()'s pet->speak() unresolved", speak, noise)
+    if name in SYMBOL_FIXTURES:
+        assert any(v["caller_name"] == "_ZN3zoo6Kennel5noiseEv" and v["target_names"] == ["_ZN3zoo3Dog5speakEv"]
+                   for v in noise), (name, "Kennel::noise site", noise)
 
 
 INLINED_CTORS = ("testprog_o2", "testprog_msvc64_nortti.exe")
@@ -497,6 +536,7 @@ def main(argv):
             check_struct_returns(name, load(name))
             check_construction(name, load(name))
             check_nonvirtual(name, load(name))
+            check_kennel(name, load(name))
             print("ok  ", name)
         except AssertionError as e:
             failed += 1

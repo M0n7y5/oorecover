@@ -700,7 +700,11 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                     size = limit - off
                     if size != ptrsize:
                         hint = "int"
-                sb.insert(off, _member_type(bv, size, hint), "m_%x" % off)
+                pointee = cls.member_classes.get(off)
+                if pointee is not None and size == ptrsize:
+                    sb.insert(off, _named_ptr(bv, pointee), "m_%x" % off)
+                else:
+                    sb.insert(off, _member_type(bv, size, hint), "m_%x" % off)
                 prev_end = off + size
             try:
                 new_struct = Type.structure_type(sb)

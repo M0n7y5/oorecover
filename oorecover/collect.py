@@ -33,6 +33,7 @@ _VCALL_SITES = _CALLS + (Op.MLIL_JUMP,)
 _EQ_CMPS = (Op.MLIL_CMP_E, Op.MLIL_CMP_NE)
 _LOADS = (Op.MLIL_LOAD_SSA, Op.MLIL_LOAD_STRUCT_SSA)
 _STORES = (Op.MLIL_STORE_SSA, Op.MLIL_STORE_STRUCT_SSA)
+_OBJECT_ROOTS = ("this", "param", "alloc", "stack", "global")   # roots the model maps to classes
 _TIMES = {"request": 0.0, "il": 0.0, "vars": 0.0, "walk": 0.0, "alias": 0.0, "rest": 0.0}   # per pass, seconds
 IL_CHUNK = 4096   # functions whose advanced analysis data the core holds at once
 
@@ -642,8 +643,8 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
         return None if r is None else (r[0], r[1] + field_offset)
 
     ptrsize = mem.ptrsize
-    vptr_vars = {}    # ssa key -> (root, object offset) whose vtable pointer it holds
-    fnptr_vars = {}   # ssa key -> (root, object offset, slot)
+    tables = ({}, {})   # ssa key -> (root, object offset) whose vtable pointer it holds,
+                        # ssa key -> (root, object offset, slot) of a function pointer it holds
 
     def split_add(expr):
         if expr.operation in (Op.MLIL_ADD, Op.MLIL_SUB):
@@ -656,61 +657,88 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                     return expr.right, c
         return expr, 0
 
-    def vptr_of(expr):
+    def vptr_of(expr, tables):
         """(root, object offset) when expr yields the vtable pointer of an object."""
         op = expr.operation
         if op == Op.MLIL_VAR_SSA:
-            return vptr_vars.get(_key(expr.src))
+            return tables[0].get(_key(expr.src))
         if op in _LOADS:
             return resolve_field(expr.src, expr.offset if op == Op.MLIL_LOAD_STRUCT_SSA else 0)
         return None
 
-    def slot_of(expr):
+    def slot_of(expr, tables):
         """(root, object offset, slot) when expr yields a function pointer
         loaded from an object's vtable."""
         op = expr.operation
         if op == Op.MLIL_VAR_SSA:
-            return fnptr_vars.get(_key(expr.src))
+            return tables[1].get(_key(expr.src))
         if op not in _LOADS:
             return None
         base, k = split_add(expr.src)
         k += expr.offset if op == Op.MLIL_LOAD_STRUCT_SSA else 0
-        vp = vptr_of(base)
+        vp = vptr_of(base, tables)
         if vp is None or k < 0 or k % ptrsize:
             return None
         return vp[0], vp[1], k // ptrsize
 
+    def propagate_vptrs(tables):
+        vptr_vars, fnptr_vars = tables
+        for _ in range(MAX_PASSES):
+            changed = False
+            for insn in insns:
+                op = insn.operation
+                if op == Op.MLIL_VAR_PHI:
+                    # A speculatively devirtualised call reloads the vtable on
+                    # its indirect branch and merges it with the first load.
+                    key = _key(insn.dest)
+                    srcs = [_key(s) for s in insn.src]
+                    for table in tables:
+                        vals = [table.get(s) for s in srcs]
+                        if key not in table and vals and vals[0] is not None and all(v == vals[0] for v in vals):
+                            table[key] = vals[0]
+                            changed = True
+                    continue
+                if op not in _SETS:
+                    continue
+                key = _key(insn.dest)
+                if key in vptr_vars or key in fnptr_vars:
+                    continue
+                vp = vptr_of(insn.src, tables)
+                if vp is not None:
+                    vptr_vars[key] = vp
+                    changed = True
+                    continue
+                fp = slot_of(insn.src, tables)
+                if fp is not None:
+                    fnptr_vars[key] = fp
+                    changed = True
+            if not changed:
+                break
+
+    propagate_vptrs(tables)
+
+    # A pointer loaded from a member of an object root past its vtable
+    # pointer is rooted at ("member", root, off); a second pair of tables
+    # follows vtable and slot loads through it, consulted only at call sites
+    # the first pair leaves unrooted, so every existing fact stays as it is.
+    member_tables = None
+    member_loads = [(_key(insn.dest), insn.src) for insn in insns
+                    if insn.operation in _SETS and insn.src.operation in _LOADS
+                    and insn.src.size == ptrsize]
     for _ in range(MAX_PASSES):
         changed = False
-        for insn in insns:
-            op = insn.operation
-            if op == Op.MLIL_VAR_PHI:
-                # A speculatively devirtualised call reloads the vtable on
-                # its indirect branch and merges it with the first load.
-                key = _key(insn.dest)
-                srcs = [_key(s) for s in insn.src]
-                for table in (vptr_vars, fnptr_vars):
-                    vals = [table.get(s) for s in srcs]
-                    if key not in table and vals and vals[0] is not None and all(v == vals[0] for v in vals):
-                        table[key] = vals[0]
-                        changed = True
+        for key, load in member_loads:
+            if key in aliases:
                 continue
-            if op not in _SETS:
-                continue
-            key = _key(insn.dest)
-            if key in vptr_vars or key in fnptr_vars:
-                continue
-            vp = vptr_of(insn.src)
-            if vp is not None:
-                vptr_vars[key] = vp
-                changed = True
-                continue
-            fp = slot_of(insn.src)
-            if fp is not None:
-                fnptr_vars[key] = fp
-                changed = True
+            r = resolve_field(load.src, load.offset if load.operation == Op.MLIL_LOAD_STRUCT_SSA else 0)
+            if r is not None and r[1] != 0 and r[0][0] in _OBJECT_ROOTS + ("member",):
+                changed |= alias(key, ("member", r[0], r[1]), 0)
+                member_tables = member_tables or ({}, {})
         if not changed:
             break
+        propagate()
+    if member_tables is not None:
+        propagate_vptrs(member_tables)
     t4 = time.perf_counter()
     _TIMES["alias"] += t4 - t3
 
@@ -727,20 +755,24 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 print("[oorecover] debug %#x aliased insn %#x %s: %s" % (
                     func.start, insn.address, insn.operation.name, insn))
         print("[oorecover] debug %#x aliases %s" % (func.start, sorted(aliases.items())[:20]))
-        print("[oorecover] debug %#x vptr_vars %s" % (func.start, vptr_vars))
-        print("[oorecover] debug %#x fnptr_vars %s" % (func.start, fnptr_vars))
+        print("[oorecover] debug %#x vptr_vars %s" % (func.start, tables[0]))
+        print("[oorecover] debug %#x fnptr_vars %s" % (func.start, tables[1]))
         for insn in insns:
             if insn.operation in _VCALL_SITES:
                 print("[oorecover] debug %#x call %#x dest %s (%s) -> %s" % (
-                    func.start, insn.address, insn.dest, insn.dest.operation.name, slot_of(insn.dest)))
+                    func.start, insn.address, insn.dest, insn.dest.operation.name, slot_of(insn.dest, tables)))
     for insn in insns:
         # A jump through a vtable slot is a tail dispatch Binary Ninja has not
         # (yet) classified as a tail call.
         if insn.operation in _VCALL_SITES:
-            fp = slot_of(insn.dest)
+            fp = slot_of(insn.dest, tables)
+            if fp is None and member_tables is not None:
+                fp = slot_of(insn.dest, member_tables)
+                if fp is not None and fp[0][0] != "member":
+                    fp = None
             if fp is not None:
                 arg0 = resolve(insn.params[0]) if insn.operation in _CALLS and insn.params else None
-                if arg0 == (fp[0], fp[1]):
+                if arg0 == (fp[0], fp[1]) or (arg0 is not None and arg0[0][0] == "member"):
                     arg0 = None
                 facts.vcalls.append(VirtualCall(func.start, insn.address, fp[0], fp[1], fp[2], arg0))
         if not facts.guarded and insn.operation == Op.MLIL_IF:
@@ -750,9 +782,13 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
             cond = insn.condition
             if cond.operation in _EQ_CMPS:
                 for a, b in ((cond.left, cond.right), (cond.right, cond.left)):
-                    if _call_target(bv, b) is not None and slot_of(a) is not None:
+                    if _call_target(bv, b) is not None and slot_of(a, tables) is not None:
                         facts.guarded = True
                         break
+
+    # Member roots serve the virtual call sites only; every other fact keeps
+    # the object roots it had.
+    aliases = {k: v for k, v in aliases.items() if v[0][0] != "member"}
 
     facts.reach = max([off for root, off in aliases.values() if root == ("this",)] + [0])
 
@@ -774,8 +810,18 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                     func.start, insn.address, insn.instr_index, val, r[0], r[1]))
             else:
                 hint = "ptr" if val is not None and val != 0 and mem.is_mapped(val) else "int"
+                # The value stored: an object root at its offset 0, a mapped
+                # address as ("global", value), any other non-zero constant
+                # as ("const", value); null names nothing.
+                if val is None:
+                    src = resolve(insn.src)
+                    src_root = src[0] if src is not None and src[1] == 0 and src[0][0] in _OBJECT_ROOTS else None
+                elif val == 0:
+                    src_root = None
+                else:
+                    src_root = ("global" if hint == "ptr" else "const", val)
                 facts.accesses.append(MemberAccess(
-                    func.start, insn.address, r[0], r[1], insn.size, True, hint))
+                    func.start, insn.address, r[0], r[1], insn.size, True, hint, src_root))
         elif op in _SETS or op in _FIELD_SETS:
             # Stack objects: plain stores, or field stores once Binary Ninja
             # has given the variable a structure type.

@@ -50,7 +50,8 @@ def build_report(bv, result):
             "embedded": {str(off): name for off, name in sorted(c.embedded.items())},
             "construction_vtables": {derived: {str(off): "%#x" % t.address for off, t in sorted(tabs.items())}
                                      for derived, tabs in sorted(c.construction.items())},
-            "members": {str(off): list(m) for off, m in sorted(c.members.items())},
+            "members": {str(off): list(m) + ([c.member_classes[off]] if off in c.member_classes else [])
+                        for off, m in sorted(c.members.items())},
             "size": c.size,
             "sites": c.sites,
             "site_functions": ["%#x %s" % (fn, root[0]) for fn, root in c.site_functions],
