@@ -1,13 +1,50 @@
 """Mangled and qualified name helpers shared by the collector and the applier."""
 import time
 
-from binaryninja.enums import TypeClass
+from binaryninja.enums import TypeClass, VariableSourceType
 from binaryninja.types import QualifiedName
 
 
 _CONFIG = (None, None)
 _SCOPES = (None, {}, frozenset())
+_ARITY = (None, {})   # per view: function start -> reads one argument register past its explicit list
 META_TYPES = "oorecover.types"    # metadata key listing the types a run of ours defined
+_REGISTER = VariableSourceType.RegisterVariableSourceType
+
+
+def _hidden_this(func):
+    """True when the function reads the integer argument register after
+    the ones its declared explicit parameters occupy: a member whose this
+    the signature omits (5.3), or a 6.0 signature whose bogus this pushed
+    the explicit list one register right so the function reads one fewer.
+    None when the layout is not plain registers or no register follows."""
+    cc = func.calling_convention
+    if cc is None:
+        return None
+    regs = [func.arch.get_reg_index(r) for r in cc.int_arg_regs]
+    pvars = list(func.parameter_vars)
+    locs = func.parameter_locations.locations   # len() of the wrapper is broken in 6.0.10601
+    used = set()
+    for i, v in enumerate(pvars):
+        if v.name == "this":
+            continue
+        var = locs[i].components[0].var if i < len(locs) and locs[i].components else v
+        if var.source_type != _REGISTER or var.storage not in regs:
+            return None
+        used.add(var.storage)
+    k = len(used)
+    if k >= len(regs):
+        return None
+    mlil = func.mlil
+    ssa = mlil.ssa_form if mlil is not None else None
+    if ssa is None:
+        return None
+    for sv in ssa.ssa_vars:
+        v = sv.var
+        if (v.source_type == _REGISTER and v.storage == regs[k]
+                and ssa.get_ssa_var_definition(sv) is None and ssa.get_ssa_var_uses(sv)):
+            return True
+    return False
 
 
 def demangler_config(bv):
@@ -111,9 +148,13 @@ def scan_scopes(bv, class_names=(), log=print):
     destructor or cv-qualified member symbol (only members carry const), a
     demangled signature mentioning it as a parameter or return type (a
     namespace never is), or a structure type in the view that no run of ours
-    created. Cached per view; returns ({function start: scope}, classes,
-    functions whose scope flipped since the previous scan of the view)."""
-    global _SCOPES
+    created. A scope with none of that, and not the prefix of another scope
+    (a namespace nesting classes; a struct returned by value reads one
+    register more, which would pass for a hidden this), is a class when one
+    of its functions reads the argument register past its explicit list
+    (_hidden_this). Cached per view; returns ({function start: scope},
+    classes, functions whose scope flipped since the previous scan)."""
+    global _SCOPES, _ARITY
     t0 = time.time()
     by_start = {}
     scopes = set()
@@ -159,6 +200,31 @@ def scan_scopes(bv, class_names=(), log=print):
         t = bv.get_type_by_name(QualifiedName(split_qualified(scope)))
         if t is not None and t.type_class == TypeClass.StructureTypeClass and t.width > 0:
             classes.add(scope)
+    cached_arity, arity = _ARITY
+    if cached_arity is not bv:
+        arity = {}
+    t_arity = time.time()
+    checked = 0
+    prefixes = set()
+    for scope in scopes:
+        parts = split_qualified(scope)
+        for n in range(1, len(parts)):
+            prefixes.add("::".join(parts[:n]))
+    for start, scope in by_start.items():
+        if scope is None or scope in classes or scope in prefixes:
+            continue
+        if start not in arity:
+            checked += 1
+            try:
+                arity[start] = _hidden_this(bv.get_function_at(start))
+            except Exception:
+                arity[start] = None
+        if arity[start]:
+            classes.add(scope)
+    _ARITY = (bv, arity)
+    if checked:
+        log("[oorecover] arity evidence: %d functions of scopes without other evidence read, %.1fs"
+            % (checked, time.time() - t_arity))
     classes = frozenset(classes)
     cached, _old_starts, old = _SCOPES
     flipped = set()

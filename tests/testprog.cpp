@@ -143,6 +143,15 @@ public:
 // A namespace-scope free function: Binary Ninja 6.0 types it from the
 // mangled name with a bogus zoo* this in front of the real parameters.
 NOINLINE int feed(Animal* a, int n) { return a->speak() * n + a->legs(); }
+
+// A class with no evidence but arity: inline constructor, no const member,
+// never a parameter type. bump reads a third argument register for its
+// two explicit parameters, so it has a hidden this.
+class Counter {
+    int n = 0;
+public:
+    NOINLINE int bump(int by, Animal* a) { n += by + a->legs(); return n; }
+};
 }
 zoo::Beacon g_beacon;
 
@@ -178,7 +187,8 @@ int main() {
     zoo::Info inf2 = heap->info2(2, 3);
     int r = use(&an) + use(&d) + use(&b) + use(heap) + use(cat) + measure(&sq) + w.span + hs + an.describe() + an.rate(3) + heap->rate(2) + g_beacon.ping() + (int)inf.v[3] + (int)inf2.v[1];
     zoo::Stats st(r);
-    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3) + p.play() + p.rest() + use(&p);
+    zoo::Counter ct;
+    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3) + p.play() + p.rest() + use(&p) + ct.bump(4, heap);
     delete heap;
     delete cat;
     return r;

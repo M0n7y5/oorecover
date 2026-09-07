@@ -213,6 +213,13 @@ def check_namespaces(name, rep):
         params = v["caller_type"].split("(", 1)[1]
         assert re.fullmatch(r"(struct )?zoo::Animal\* \w+, int32_t \w+\)", params), \
             (name, "zoo::feed signature", v["caller_type"])
+    # zoo::Counter has no evidence but arity: bump reads a third argument
+    # register for its two explicit parameters, so it keeps its this.
+    bump = [v for v in rep["vcalls"] if v["caller_name"] == "_ZN3zoo7Counter4bumpEiPNS_6AnimalE"]
+    assert bump, (name, "zoo::Counter::bump's virtual call unresolved")
+    for v in bump:
+        assert v["class"] == "zoo::Animal", (name, "Counter::bump call not through Animal*", v)
+        assert "zoo::Counter* this" in v["caller_type"], (name, "Counter::bump lost its this", v["caller_type"])
 
 
 def check_puppy(name, rep):
