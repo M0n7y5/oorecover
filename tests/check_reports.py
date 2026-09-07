@@ -215,6 +215,34 @@ def check_namespaces(name, rep):
             (name, "zoo::feed signature", v["caller_type"])
 
 
+def check_puppy(name, rep):
+    """Puppy::play reads its vtable through _base_Dog._base_Animal and calls
+    fetch (slot 9, past Animal's and Dog's VTable) and kind; at -O2 gcc
+    guards each with a compare against the expected function and reloads
+    the vtable on the indirect branch. Puppy::rest is a tail dispatch
+    (jmp [rax+slot]). Every site resolves in the final pass and the guards
+    add none; nothing is lost between passes."""
+    assert not rep["lost_vcalls"], (name, "virtual calls lost between passes", rep["lost_vcalls"])
+    if name in SYMBOL_FIXTURES:
+        by_caller = {}
+        for v in rep["vcalls"]:
+            by_caller.setdefault(v["caller_name"], []).append(v)
+        rest = by_caller.get("_ZN3zoo5Puppy4restEv", [])
+        assert [v["target_names"] for v in rest] == [["_ZN3zoo5Puppy5fetchEv"]], \
+            (name, "Puppy::rest tail dispatch", rest)
+        play = by_caller.get("_ZN3zoo5Puppy4playEv", [])
+        targets = [t for v in play for t in v["target_names"]]
+        assert len(play) == 2 and "_ZN3zoo5Puppy5fetchEv" in targets and any(t.endswith("4kindEv") for t in targets), \
+            (name, "Puppy::play sites", play)
+        return
+    # Without symbols: fetch and kind are the last two slots of the longest
+    # table; play and rest both reach fetch, play reaches kind.
+    longest = max((t for c in rep["classes"] for t in c["vtables"].values()), key=lambda t: len(t["slots"]))
+    fetch = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-1]]]
+    kind = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-2]]]
+    assert len(fetch) >= 2 and len(kind) >= 1, (name, "Puppy::play and rest sites to the last slots", fetch, kind)
+
+
 INLINED_CTORS = ("testprog_o2", "testprog_msvc64_nortti.exe")
 
 
@@ -224,8 +252,8 @@ def check_nortti(name):
     classes = rep["classes"]
     inlined = name in INLINED_CTORS
     # Header-less tables (MSVC without RTTI) sit back to back; the split at
-    # referenced slots must keep them apart: Dog's table is the longest at 9.
-    assert max(len(t["slots"]) for c in classes for t in c["vtables"].values()) <= 9, \
+    # referenced slots must keep them apart: Puppy's table is the longest at 10.
+    assert max(len(t["slots"]) for c in classes for t in c["vtables"].values()) <= 10, \
         (name, "tables merged", [(c["name"], len(t["slots"])) for c in classes for t in c["vtables"].values()])
     assert not any(not c["vtables"] for c in classes), (name, "plain class in a stripped binary", [c["name"] for c in classes if not c["vtables"]])
     assert len(classes) >= 5, (name, [c["name"] for c in classes])
@@ -350,6 +378,7 @@ def main(argv):
             else:
                 check_rtti(name)
             check_namespaces(name, load(name))
+            check_puppy(name, load(name))
             print("ok  ", name)
         except AssertionError as e:
             failed += 1

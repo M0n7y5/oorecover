@@ -28,6 +28,7 @@ _SETS = (Op.MLIL_SET_VAR_SSA, Op.MLIL_SET_VAR_ALIASED)
 _FIELD_SETS = (Op.MLIL_SET_VAR_SSA_FIELD, Op.MLIL_SET_VAR_ALIASED_FIELD)
 _FIELD_VARS = (Op.MLIL_VAR_SSA_FIELD, Op.MLIL_VAR_ALIASED_FIELD)
 _CALLS = (Op.MLIL_CALL_SSA, Op.MLIL_TAILCALL_SSA)
+_VCALL_SITES = _CALLS + (Op.MLIL_JUMP,)
 _LOADS = (Op.MLIL_LOAD_SSA, Op.MLIL_LOAD_STRUCT_SSA)
 _STORES = (Op.MLIL_STORE_SSA, Op.MLIL_STORE_STRUCT_SSA)
 
@@ -572,18 +573,37 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
             return None
         return vp[0], vp[1], k // ptrsize
 
-    for _ in range(2):
+    for _ in range(MAX_PASSES):
+        changed = False
         for insn in insns:
-            if insn.operation not in _SETS:
+            op = insn.operation
+            if op == Op.MLIL_VAR_PHI:
+                # A speculatively devirtualised call reloads the vtable on
+                # its indirect branch and merges it with the first load.
+                key = _key(insn.dest)
+                srcs = [_key(s) for s in insn.src]
+                for table in (vptr_vars, fnptr_vars):
+                    vals = [table.get(s) for s in srcs]
+                    if key not in table and vals and vals[0] is not None and all(v == vals[0] for v in vals):
+                        table[key] = vals[0]
+                        changed = True
+                continue
+            if op not in _SETS:
                 continue
             key = _key(insn.dest)
+            if key in vptr_vars or key in fnptr_vars:
+                continue
             vp = vptr_of(insn.src)
             if vp is not None:
                 vptr_vars[key] = vp
+                changed = True
                 continue
             fp = slot_of(insn.src)
             if fp is not None:
                 fnptr_vars[key] = fp
+                changed = True
+        if not changed:
+            break
 
     if debug is not None:
         print = debug
@@ -601,11 +621,13 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
         print("[oorecover] debug %#x vptr_vars %s" % (func.start, vptr_vars))
         print("[oorecover] debug %#x fnptr_vars %s" % (func.start, fnptr_vars))
         for insn in insns:
-            if insn.operation in _CALLS:
+            if insn.operation in _VCALL_SITES:
                 print("[oorecover] debug %#x call %#x dest %s (%s) -> %s" % (
                     func.start, insn.address, insn.dest, insn.dest.operation.name, slot_of(insn.dest)))
     for insn in insns:
-        if insn.operation in _CALLS:
+        # A jump through a vtable slot is a tail dispatch Binary Ninja has not
+        # (yet) classified as a tail call.
+        if insn.operation in _VCALL_SITES:
             fp = slot_of(insn.dest)
             if fp is not None:
                 facts.vcalls.append(VirtualCall(func.start, insn.address, fp[0], fp[1], fp[2]))

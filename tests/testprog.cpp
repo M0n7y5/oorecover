@@ -10,6 +10,8 @@ void operator delete(void*) {}
 #include <cstddef>
 #endif
 
+int g_naps;
+
 namespace zoo {
 
 // Returned by value: too big for registers, so the caller passes a hidden
@@ -39,6 +41,20 @@ public:
     // vtables list; Animal is their common base.
     virtual int kind() { return 3; }
     int tricks;
+};
+
+// Two levels deep: a Puppy method reads its vtable through the base chain
+// (_base_Dog._base_Animal._vftable, typed as Animal's VTable) and calls a
+// slot past that VTable's width. Speculative devirtualisation at -O2 guards
+// the slot with a compare against the expected function; rest() becomes a
+// tail dispatch (jmp [rax+slot]) at -O2 once speculation is off for it.
+class Puppy : public Dog {
+public:
+    ~Puppy() override { g_naps++; }   // a side effect keeps --icf from folding it into Dog's
+    virtual int fetch() { return stamina + tricks; }
+    int play();
+    int rest();
+    int stamina;
 };
 
 class Wing {
@@ -98,11 +114,15 @@ public:
 
 #ifdef _MSC_VER
 #define NOINLINE __declspec(noinline)
+#define NOSPEC
 #else
 #define NOINLINE __attribute__((noinline))
+#define NOSPEC __attribute__((optimize("no-devirtualize-speculatively")))
 #endif
 
 NOINLINE int zoo::Animal::rate(int k) { return speak() * k + age; }
+NOINLINE int zoo::Puppy::play() { return fetch() * 2 + kind(); }
+NOINLINE NOSPEC int zoo::Puppy::rest() { return fetch(); }
 NOINLINE zoo::Stats::Stats(int seed) : total(seed), count(0), last(-1) {}
 NOINLINE int zoo::Stats::bump(int by) { total += by; count++; last = by; return total; }
 
@@ -136,6 +156,10 @@ int main() {
     d.age = 3;
     d.tricks = 5;
     d.bark();
+    zoo::Puppy p;
+    p.age = 1;
+    p.tricks = 2;
+    p.stamina = 8;
     zoo::Bat b;
     b.age = 1;
     b.span = 40;
@@ -154,7 +178,7 @@ int main() {
     zoo::Info inf2 = heap->info2(2, 3);
     int r = use(&an) + use(&d) + use(&b) + use(heap) + use(cat) + measure(&sq) + w.span + hs + an.describe() + an.rate(3) + heap->rate(2) + g_beacon.ping() + (int)inf.v[3] + (int)inf2.v[1];
     zoo::Stats st(r);
-    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3);
+    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3) + p.play() + p.rest() + use(&p);
     delete heap;
     delete cat;
     return r;
