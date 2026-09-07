@@ -26,7 +26,60 @@ public:
 };
 ```
 
-`tests/testprog_stripped` is that program built with `g++ -O1 -fno-inline -s`: RTTI present, no symbols. Binary Ninja's own RTTI pass already names the tables (`_vtable_for_zoo::Animal` at `0x404c28`, typed `struct zoo::Animal::VTable`; `_vtable_for_zoo::Dog{for `zoo::Animal'}` at `0x4047b0`) but there is no `zoo::Animal` struct, no member, and every method is a `sub_` with auto-typed parameters. After the run (`tests/reports/testprog_stripped.json`), the tables keep their names and the rest is filled in:
+`tests/testprog_stripped` is that program built with `g++ -O1 -fno-inline -s`: RTTI present, no symbols, so Binary Ninja's own RTTI pass already names the vtables (`_vtable_for_zoo::Animal`, typed `struct zoo::Animal::VTable`) but every method is a `sub_` with auto-typed parameters. Pseudo C before and after the run, as `tests/reports/testprog_stripped.decompile.md` captures it:
+
+`zoo::Animal::Animal()` before:
+```c
+int64_t sub_402982(struct zoo::Animal::VTable** arg1)
+{
+    *(uint64_t*)arg1 = &_vtable_for_zoo::Animal;
+    arg1[1] = 0;
+    arg1[2] = 1;
+    return &_vtable_for_zoo::Animal;
+}
+```
+after:
+```c
+int64_t zoo::Animal::ctor(struct zoo::Animal* this)
+{
+    *(uint192_t*)this = struct zoo::Animal {
+        ._vftable = &_vtable_for_zoo::Animal,
+        .m_8 = 0,
+        .m_10 = 1
+    };
+    return &_vtable_for_zoo::Animal;
+}
+```
+`zoo::Animal::rate(int)` before:
+```c
+uint64_t sub_4021dc(int64_t* arg1, int32_t arg2)
+{
+    return (uint64_t)((*(uint64_t*)(*(uint64_t*)arg1 + 0x10))() * arg2 + arg1[1]);
+}
+```
+after:
+```c
+uint64_t zoo::Animal::method_4021dc(struct zoo::Animal* this, int32_t arg2)
+{
+    return (uint64_t)(this->_vftable->vfunc_2(this) * arg2 + this->m_8);
+}
+```
+`zoo::Dog::speak()` before:
+```c
+uint64_t sub_40280a(void* arg1)
+{
+    return (uint64_t)(*(uint32_t*)((char*)arg1 + 8) + *(uint32_t*)((char*)arg1 + 0x18));
+}
+```
+after:
+```c
+uint64_t zoo::Dog::vfunc_2(struct zoo::Dog* this)
+{
+    return (uint64_t)(this->_base_Animal.m_8 + this->m_18);
+}
+```
+
+The struct behind those names, with the source members for reference:
 
 ```c
 struct zoo::Animal {                    // width 24
@@ -34,27 +87,7 @@ struct zoo::Animal {                    // width 24
     uint32_t m_8;                          // 8   (age)
     uint64_t m_10;                         // 16  (tag)
 };
-struct zoo::Dog {                       // width 32
-    struct zoo::Animal _base_Animal;       // 0
-    uint32_t m_18;                         // 24  (tricks)
-};
-struct zoo::Animal::VTable {            // width 72, slots 0..8
-    int64_t (*vfunc_0)(struct zoo::Animal* this);   // 0
-    int64_t (*dtor)(struct zoo::Animal* this);      // 8
-    uint64_t (*vfunc_2)(struct zoo::Animal* this);  // 16  (speak)
-    struct zoo::Animal::vfunc_5_result (*vfunc_5)(struct zoo::Animal* this);  // 40  (info, returned by hidden pointer)
-    ...
-};
 ```
-
-| address | before (stripped) | after | symbol in `tests/testprog` |
-|---|---|---|---|
-| 0x402982 | `sub_402982` | `zoo::Animal::ctor`, `int64_t(struct zoo::Animal* this)` | `_ZN3zoo6AnimalC1Ev` |
-| 0x402924 | `sub_402924` | `zoo::Animal::dtor`, `int64_t(struct zoo::Animal* this)` | `_ZN3zoo6AnimalD0Ev` |
-| 0x402766 | `sub_402766` | `zoo::Animal::vfunc_2`, `uint64_t(struct zoo::Animal* this)` | `_ZN3zoo6Animal5speakEv` |
-| 0x40279c | `sub_40279c` | `zoo::Animal::vfunc_5`, `struct zoo::Animal::vfunc_5_result(struct zoo::Animal* this @ rsi)`, return location `*rdi -> *rax` | `_ZN3zoo6Animal4infoEv` |
-| 0x4021dc | `sub_4021dc` | `zoo::Animal::method_4021dc`, `uint64_t(struct zoo::Animal* this, int32_t arg2)` | `_ZN3zoo6Animal4rateEi` |
-| 0x40280a | `sub_40280a` | `zoo::Dog::vfunc_2`, `uint64_t(struct zoo::Dog* this)` | `_ZN3zoo3Dog5speakEv` |
 
 `rate` has no vtable slot; it is named `method_4021dc` because every caller passes an `Animal` built at the call site and the body reads a member past the vtable pointer. The free function `zoo::feed(Animal* a, int n)` at `0x4022c7` stays `sub_4022c7` (nothing names it) but gets the signature `uint64_t(struct zoo::Animal* arg1, int32_t arg2)` from the objects its callers pass, and its two virtual calls are resolved and cross-referenced:
 
@@ -122,7 +155,7 @@ In-GUI runs: with Binary Ninja open, write the fixture paths one per line to `te
 
 Offline tests, each runnable with plain `python3`: `tests/check_names.py` (undefined-name scan of the sources, which hot reload hides; no Binary Ninja needed), `tests/test_validate.py` (consistency rules on synthetic models) and `tests/test_demangle.py` (typeinfo and MSVC type name demangling). The last two import the plugin package, which imports `binaryninja`, so put the Binary Ninja Python API on `PYTHONPATH`.
 
-Directives: `tests/trace.txt` with `0xADDR` words (plus `after-apply` to trace after a first recover-and-apply, `callers` to include callers) makes the next run trace those functions instead of recovering; `tests/reanalyze.txt` makes it discard the saved analysis and reanalyse the whole binary first, to measure what a core upgrade changes. Both files are gitignored.
+Directives: `tests/trace.txt` with `0xADDR` words (plus `after-apply` to trace after a first recover-and-apply, `callers` to include callers) makes the next run trace those functions instead of recovering; `tests/decompile.txt` with `0xADDR [label]` lines makes it write each function's Pseudo C before and after the run to `tests/reports/<fixture>.decompile.md`; `tests/reanalyze.txt` makes it discard the saved analysis and reanalyse the whole binary first, to measure what a core upgrade changes. All three files are gitignored.
 
 ## Binary Ninja 6.0 notes
 
