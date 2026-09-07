@@ -33,7 +33,8 @@ _VCALL_SITES = _CALLS + (Op.MLIL_JUMP,)
 _EQ_CMPS = (Op.MLIL_CMP_E, Op.MLIL_CMP_NE)
 _LOADS = (Op.MLIL_LOAD_SSA, Op.MLIL_LOAD_STRUCT_SSA)
 _STORES = (Op.MLIL_STORE_SSA, Op.MLIL_STORE_STRUCT_SSA)
-_TIMES = {"il": 0.0, "vars": 0.0, "walk": 0.0, "alias": 0.0, "rest": 0.0}   # per pass, seconds
+_TIMES = {"request": 0.0, "il": 0.0, "vars": 0.0, "walk": 0.0, "alias": 0.0, "rest": 0.0}   # per pass, seconds
+IL_CHUNK = 4096   # functions whose advanced analysis data the core holds at once
 
 
 class FunctionFacts:
@@ -913,6 +914,18 @@ def _callers(bv, starts):
 _SEEN = set()   # functions the previous collect_all visited, facts or not
 
 
+def _request_il(bv, funcs):
+    """Have the core generate the advanced analysis data (MLIL included) of
+    funcs on its worker threads and keep it until released; func.mlil alone
+    generates one function at a time on the calling thread. The wait returns
+    once the requested functions are done, whether or not analysis was dirty."""
+    t0 = time.perf_counter()
+    for func in funcs:
+        func.request_advanced_analysis_data()
+    bv.update_analysis_and_wait()
+    return time.perf_counter() - t0
+
+
 def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, extra=(),
                 class_names=(), reuse=None, changed=(), changed_types=()):
     """Facts per function. With reuse (the previous pass's facts) only the
@@ -957,10 +970,24 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
             % (len(pending), len(relevant), len(retyped), len(flipped), len(callers), t_callers,
                len(set(extra) & relevant), len(new), len(result)))
     seen = set()
+    held = {}   # start -> Function whose advanced analysis data is requested
+    requested = 0
+    waits = 0
+    waited = 0.0
     no_il = 0
     failed = 0
     total = 0
     while pending:
+        if not held:
+            for addr in pending[-IL_CHUNK:]:
+                if addr not in seen and addr not in held:
+                    func = bv.get_function_at(addr)
+                    if func is not None:
+                        held[addr] = func
+            if held:
+                waited += _request_il(bv, held.values())
+                waits += 1
+                requested += len(held)
         addr = pending.pop()
         if addr in seen:
             continue
@@ -970,9 +997,12 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
         total += 1
         if progress and total % 100 == 0:
             progress("collecting facts %d (%d queued)" % (total, len(pending)))
-        func = bv.get_function_at(addr)
-        if func is None:
-            continue
+        func = held.pop(addr, None)
+        hold = func is not None
+        if not hold:
+            func = bv.get_function_at(addr)
+            if func is None:
+                continue
         try:
             f = collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator,
                                  log if func.start in debug_funcs else None, slot_functions)
@@ -981,6 +1011,11 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
             if failed <= 5:
                 log("[oorecover] collect failed in %#x:\n%s" % (addr, traceback.format_exc()))
             continue
+        finally:
+            # Released right after use: the core keeps every requested function's
+            # IL resident until its request count drops back to zero.
+            if hold:
+                func.release_advanced_analysis_data()
         if f is None:
             no_il += 1
             continue
@@ -988,10 +1023,14 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
             pending.append(f.tail_target)
         if not f.empty():
             result[addr] = f
+    for func in held.values():
+        func.release_advanced_analysis_data()
+    _TIMES["request"] = waited
     log("[oorecover] facts from %d functions (%d visited now, %d without IL, %d failed)"
         % (len(result), total, no_il, failed))
-    log("[oorecover] collect time: IL %.1fs, entry vars %.1fs, instruction walk %.1fs, "
-        "alias and vtable propagation %.1fs, facts %.1fs"
-        % (_TIMES["il"], _TIMES["vars"], _TIMES["walk"], _TIMES["alias"], _TIMES["rest"]))
+    log("[oorecover] collect time: IL requested for %d functions in %d waits %.1fs, IL %.1fs, "
+        "entry vars %.1fs, instruction walk %.1fs, alias and vtable propagation %.1fs, facts %.1fs"
+        % (requested, waits, _TIMES["request"], _TIMES["il"], _TIMES["vars"], _TIMES["walk"],
+           _TIMES["alias"], _TIMES["rest"]))
     _SEEN = seen if reuse is None else _SEEN | seen
     return result
