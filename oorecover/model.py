@@ -709,11 +709,12 @@ def build_model(bv, mem, tables, facts, log=print):
                      if a.root == root and a.size == ptrsize
                      and a.src_root is not None and a.src_root[0] != "const")
     widened = 0
+    every = {c.name: c for c in classes}    # by_name predates the plain classes
     for cls in reversed(topo_order(classes)):
         subs = [(b.offset, b.name) for b in cls.bases if b.offset is not None and not b.virtual]
         subs += list(cls.embedded.items())
         for start, name in subs:
-            sub = by_name.get(name)
+            sub = every.get(name)
             if sub is None or sub is cls:
                 continue
             for off, m in cls.members.items():
