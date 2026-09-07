@@ -171,8 +171,10 @@ def _returns_indirect(func):
 
 def _entry_vars(ssa):
     """The SSA variables no instruction defines: the function's incoming
-    values, read once for the three parameter helpers below."""
-    return [sv for sv in ssa.ssa_vars if ssa.get_ssa_var_definition(sv) is None]
+    values, read once for the three parameter helpers below. Version 0
+    only: a struct-typed load gives Binary Ninja undefined later versions
+    of the argument registers that are not incoming values."""
+    return [sv for sv in ssa.ssa_vars if sv.version == 0 and ssa.get_ssa_var_definition(sv) is None]
 
 
 def _this_keys(bv, func, entry, sret=False):
@@ -721,10 +723,14 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
     # pointer is rooted at ("member", root, off); a second pair of tables
     # follows vtable and slot loads through it, consulted only at call sites
     # the first pair leaves unrooted, so every existing fact stays as it is.
+    # Functions whose indirect call sites the first pair all roots skip it.
     member_tables = None
-    member_loads = [(_key(insn.dest), insn.src) for insn in insns
-                    if insn.operation in _SETS and insn.src.operation in _LOADS
-                    and insn.src.size == ptrsize]
+    member_loads = []
+    if any(insn.operation in _VCALL_SITES and insn.dest.operation not in _CONSTS
+           and slot_of(insn.dest, tables) is None for insn in insns):
+        member_loads = [(_key(insn.dest), insn.src) for insn in insns
+                        if insn.operation in _SETS and insn.src.operation in _LOADS
+                        and insn.src.size == ptrsize]
     for _ in range(MAX_PASSES):
         changed = False
         for key, load in member_loads:
@@ -761,6 +767,14 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
             if insn.operation in _VCALL_SITES:
                 print("[oorecover] debug %#x call %#x dest %s (%s) -> %s" % (
                     func.start, insn.address, insn.dest, insn.dest.operation.name, slot_of(insn.dest, tables)))
+        print("[oorecover] debug %#x member roots %s" % (
+            func.start, sorted((k, v) for k, v in aliases.items() if v[0][0] == "member")[:20]))
+        print("[oorecover] debug %#x member vptr_vars %s fnptr_vars %s" % (
+            func.start, member_tables and member_tables[0], member_tables and member_tables[1]))
+        for insn in insns:
+            if insn.operation in _VCALL_SITES and member_tables is not None:
+                print("[oorecover] debug %#x call %#x via member -> %s" % (
+                    func.start, insn.address, slot_of(insn.dest, member_tables)))
     for insn in insns:
         # A jump through a vtable slot is a tail dispatch Binary Ninja has not
         # (yet) classified as a tail call.
@@ -856,6 +870,15 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 r = resolve(param)
                 if r is not None and r[1] >= 0:
                     facts.argpasses.append(ArgPass(func.start, insn.address, target, index, r[0], r[1]))
+    if debug is not None:
+        il = {}
+        for insn in insns:
+            il.setdefault(insn.address, []).append(str(insn))
+        print("[oorecover] debug %#x accesses %s" % (func.start, sorted(
+            (hex(a.insn), a.root, a.offset, a.size, "w" if a.is_write else "r", a.src_root, il.get(a.insn))
+            for a in facts.accesses)))
+        print("[oorecover] debug %#x argpasses %s" % (func.start, sorted(
+            (hex(a.insn), hex(a.callee), a.index, a.root, a.offset) for a in facts.argpasses)))
     _TIMES["rest"] += time.perf_counter() - t4
     if not sret and mangled(func) and not member(bv, func) \
             and _returns_first_register(bv, func, facts, insns, resolve):

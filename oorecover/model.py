@@ -691,6 +691,39 @@ def build_model(bv, mem, tables, facts, log=print):
                 elif off not in cls.embedded:
                     cls.embedded[off] = target.name
 
+    # A holder stores an object pointer whole into a base or embedded
+    # object's member that the object's own accesses show narrower (a
+    # pointer wrapper touched by halves inside): same memory, so the member
+    # is that wide. A wider constant store proves nothing (it may cover
+    # padding or a neighbour). Holders first, so nested objects follow.
+    whole = set()    # (holder, offset) of pointer-sized stores of an object root
+    for cls in classes:
+        for fn in cls.owns():
+            ff = facts.get(fn)
+            if ff is not None and fn not in cls.thunks:
+                whole.update((cls.name, a.offset) for a in ff.accesses
+                             if a.root == ("this",) and a.size == ptrsize
+                             and a.src_root is not None and a.src_root[0] != "const")
+    for faddr, root, cls in sites:
+        whole.update((cls.name, a.offset) for a in facts[faddr].accesses
+                     if a.root == root and a.size == ptrsize
+                     and a.src_root is not None and a.src_root[0] != "const")
+    widened = 0
+    for cls in reversed(topo_order(classes)):
+        subs = [(b.offset, b.name) for b in cls.bases if b.offset is not None and not b.virtual]
+        subs += list(cls.embedded.items())
+        for start, name in subs:
+            sub = by_name.get(name)
+            if sub is None or sub is cls:
+                continue
+            for off, m in cls.members.items():
+                inner = sub.members.get(off - start)
+                if inner is not None and inner[0] < ptrsize and (cls.name, off) in whole:
+                    inner[0] = ptrsize
+                    widened += 1
+    if widened:
+        log("[oorecover] %d embedded members widened to the holder's pointer stores" % widened)
+
     findings += validate.check_structure(topo_order(classes), alloc_sizes,
                                 lambda c: c.extent(ptrsize, by_name), log)
 

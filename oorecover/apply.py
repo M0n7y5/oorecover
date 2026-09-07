@@ -574,6 +574,9 @@ def apply_param_types(bv, param_classes, claimed, class_names, retyped, log=prin
                 if (current.type_class == TypeClass.PointerTypeClass
                         and current.target.type_class == TypeClass.NamedTypeReferenceClass):
                     continue
+                # The argpass class wins over a scalar the mangled name declares
+                # (enf::Instance::Call(uint, ...) got HumanCommandScript* from its
+                # callers' this); only an existing struct pointer is kept.
                 params[at] = FunctionParameter(_named_ptr(bv, name), params[at].name)
                 changed = True
             if not changed:

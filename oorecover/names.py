@@ -131,7 +131,9 @@ def hidden_this(func):
         return None
     for sv in ssa.ssa_vars:
         v = sv.var
-        if (v.source_type == _REGISTER and v.storage == regs[k]
+        # Version 0 only: struct-typed loads give undefined later versions
+        # of the argument registers that are not incoming values.
+        if (v.source_type == _REGISTER and v.storage == regs[k] and sv.version == 0
                 and ssa.get_ssa_var_definition(sv) is None and ssa.get_ssa_var_uses(sv)):
             return True
     return False
