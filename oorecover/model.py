@@ -17,85 +17,11 @@ Rules:
 import re
 
 from binaryninja.enums import TypeClass
+from binaryninja.types import QualifiedName
 
 from .facts import BaseRef
-from .names import mangled_class, member
+from .names import META_TYPES, mangled_class, member, member_class, split_qualified, symbol_role
 from . import validate
-
-_MARKER = re.compile(r"(C[123]|D[012])E")
-
-
-def _skip_ident(raw, pos):
-    m = re.match(r"\d+", raw[pos:])
-    return pos + len(m.group(0)) + int(m.group(0))
-
-
-_STD_ABBREV = "tabsiod"
-
-
-def _skip_substitution(raw, pos):
-    """S_ / S<seq>_ substitutions and the two-letter St/Sa/Sb/Ss/Si/So/Sd forms."""
-    if pos + 1 < len(raw) and raw[pos + 1] in _STD_ABBREV:
-        return pos + 2
-    end = raw.find("_", pos)
-    return len(raw) if end < 0 else end + 1
-
-
-def _skip_group(raw, pos):
-    """Skip a group opened at pos by I (template args) or N (nested name) or
-    L (literal) up to and including its closing E, honouring length-prefixed
-    identifiers, which may contain E/I/N."""
-    depth = 0
-    while pos < len(raw):
-        ch = raw[pos]
-        if ch.isdigit():
-            pos = _skip_ident(raw, pos)
-        elif ch in "INL":
-            depth += 1
-            pos += 1
-            if ch == "L" and raw.startswith("_Z", pos):
-                pos += 2
-        elif ch == "E":
-            depth -= 1
-            pos += 1
-            if depth == 0:
-                return pos
-        elif ch == "S":
-            pos = _skip_substitution(raw, pos)
-        else:
-            pos += 1
-    return pos
-
-
-def _skip_template_args(raw, pos):
-    return _skip_group(raw, pos)
-
-
-def _itanium_role(raw):
-    """Walk the nested-name components of a mangled name; constructor and
-    destructor markers are the only components without a length prefix."""
-    if not raw.startswith("_ZN"):
-        return None
-    pos = 3
-    while pos < len(raw):
-        ch = raw[pos]
-        if ch.isdigit():
-            pos = _skip_ident(raw, pos)
-            continue
-        m = _MARKER.match(raw, pos)
-        if m:
-            return "ctor" if m.group(1)[0] == "C" else "dtor"
-        if ch == "I":
-            pos = _skip_template_args(raw, pos)
-            continue
-        if raw.startswith("St", pos) or ch in "KVr":
-            pos += 2 if raw.startswith("St", pos) else 1
-            continue
-        if ch == "S":
-            pos = _skip_substitution(raw, pos)
-            continue
-        return None
-    return None
 
 
 class ClassModel:
@@ -251,21 +177,6 @@ def symbol_thunk_shift(bv, addr):
         return int(m.group(1))
     if raw.startswith("_ZTv"):
         return -1
-    return None
-
-
-def symbol_role(bv, addr):
-    """'ctor' or 'dtor' when the function's mangled name says so, else None."""
-    sym = bv.get_symbol_at(addr)
-    if sym is None:
-        return None
-    raw = sym.raw_name
-    if raw.startswith("_Z"):
-        return _itanium_role(raw)
-    if raw.startswith("??0"):
-        return "ctor"
-    if raw.startswith(("??1", "??_G", "??_E")):
-        return "dtor"
     return None
 
 
@@ -763,6 +674,9 @@ def build_model(bv, mem, tables, facts, log=print):
                 insn, caller, cls_name, " (exact)" if exact else "",
                 ", ".join("%#x" % t for t in targets)))
 
+    result_types, sret_hints, findings_rt = resolve_result_types(bv, classes, facts, claimed, vcalls, log)
+    findings += findings_rt
+
     classes.sort(key=lambda c: c.name)
     log("[oorecover] model: %d classes, %d ctors, %d dtors, %d with bases, %d sites, "
         "%d virtual calls resolved (%d targets)"
@@ -771,7 +685,184 @@ def build_model(bv, mem, tables, facts, log=print):
            len(sites), len(vcalls), sum(len(v[4]) for v in vcalls)))
     return classes, vcalls, param_classes, {
         "findings": findings, "unowned": unowned,
-        "instances": {addr: c.name for addr, c in instances.items()}}
+        "instances": {addr: c.name for addr, c in instances.items()},
+        "result_types": result_types, "sret_hints": sret_hints}
+
+
+def _struct_name(t):
+    """Name of a named structure type, else None."""
+    try:
+        if t.type_class == TypeClass.NamedTypeReferenceClass:
+            return str(t.name)
+    except Exception:
+        pass
+    return None
+
+
+def resolve_result_types(bv, classes, facts, claimed, vcalls, log=print):
+    """{function: class name} for methods returning a struct by value whose
+    hidden buffer names its type beyond doubt, else the applier keeps a
+    placeholder sized from the writes. The buffer handed as this to a
+    constructor or a this-reading member of another class C at least as
+    large as the writes is a C (rule 1); the buffer forwarded as the hidden
+    return of a callee whose result is known is that result (rule 2, to a
+    fixed point, through direct calls and resolved virtual calls). Every
+    implementation of one virtual slot returns the same type, so a resolved
+    type covers its slot across the hierarchy; a slot resolved to two types
+    is reported and left alone. Also returns the functions of a slot whose
+    other implementations return a struct by value but that showed neither
+    a buffer write nor a constructor call themselves (a pure forward): the
+    next pass collects them with the buffer keyed as such."""
+    try:
+        own = bv.query_metadata(META_TYPES)
+    except Exception:
+        own = []
+    own = set(own) if isinstance(own, (list, tuple)) else set()
+    by_name = {c.name: c for c in classes}    # plain classes included
+
+    def defined_size(name):
+        if name in by_name:
+            return by_name[name].size
+        t = bv.get_type_by_name(QualifiedName(split_qualified(name)))
+        if t is not None and t.type_class == TypeClass.StructureTypeClass:
+            return t.width
+        return None
+
+    def own_class(fn):
+        cls = claimed.get(fn)
+        if cls is not None:
+            return cls.name
+        func = bv.get_function_at(fn)
+        return mangled_class(bv, func) if func is not None else None
+
+    # Slot groups: slot i of a class's table at off is slot i of the base
+    # at off (its primary table for off 0), so overrides share a group.
+    parent = {}
+
+    def find(key):
+        while parent.setdefault(key, key) != key:
+            key = parent[key]
+        return key
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    members = {}
+    for cls in classes:
+        for off, t in cls.vtables.items():
+            base = base_at(cls, off, by_name) if off else next(
+                (b.name for b in cls.bases if b.offset == 0 and b.name in by_name), None)
+            for i, fn in enumerate(t.slots):
+                if fn is None:
+                    continue
+                key = (cls.name, off, i)
+                members.setdefault(find(key), set()).add(fn)
+                if base is not None and base in by_name:
+                    union(key, (base, 0, i))
+    groups = {}
+    for key, fns in members.items():
+        groups.setdefault(find(key), set()).update(fns)
+    group_of = {fn: root for root, fns in groups.items() for fn in fns}
+
+    by_site = {(caller, insn): targets for caller, insn, _c, _e, targets in vcalls}
+    out = {}
+    source = {}     # function -> "call" (rule 1), "forward" (rule 2) or "slot"
+    findings = []
+    candidates = 0
+    for _ in range(64):
+        changed = False
+        for fn, ff in facts.items():
+            if not ff.sret or fn in out:
+                continue
+            mine = own_class(fn)
+            for ap in ff.argpasses:
+                if ap.root != ("sret",) or ap.offset != 0 or ap.index != 0:
+                    continue
+                cfunc = bv.get_function_at(ap.callee)
+                if cfunc is None:
+                    continue
+                cf = facts.get(ap.callee)
+                loc = cfunc.return_value_location
+                if (cf is not None and cf.sret) or (loc is not None and loc.location.indirect):
+                    # Rule 2: forwarded as the callee's own hidden return.
+                    name = out.get(ap.callee)
+                    if name is None:
+                        name = _struct_name(cfunc.return_type)
+                        if name in own and name.endswith("_result"):
+                            name = None
+                    if name is not None:
+                        out[fn] = name
+                        source[fn] = "forward"
+                        changed = True
+                        break
+                    continue
+                theirs = member_class(bv, cfunc)
+                reads = symbol_role(bv, ap.callee) == "ctor" or (cf is not None and cf.entry_this)
+                if theirs is None or theirs == mine or not reads:
+                    continue
+                size = defined_size(theirs)
+                if size is None:
+                    candidates += 1
+                    if candidates <= 5:
+                        log("[oorecover] result of %#x: %s undefined, placeholder kept" % (fn, theirs))
+                    continue
+                if size >= ff.sret_size:
+                    out[fn] = theirs
+                    source[fn] = "call"
+                    changed = True
+                    break
+            if fn in out:
+                continue
+            for vc in ff.vcalls:
+                if vc.arg0 != (("sret",), 0):
+                    continue
+                names = {out.get(t) for t in by_site.get((fn, vc.insn), ())}
+                if len(names) == 1 and None not in names:
+                    out[fn] = names.pop()
+                    source[fn] = "forward"
+                    changed = True
+                    break
+        for root, fns in groups.items():
+            names = {out[f] for f in fns if f in out}
+            if len(names) == 1:
+                name = names.pop()
+                for f in fns:
+                    if f not in out:
+                        out[f] = name
+                        source[f] = "slot"
+                        changed = True
+        if not changed:
+            break
+    for root, fns in groups.items():
+        names = sorted({out[f] for f in fns if f in out})
+        if len(names) > 1:
+            findings.append(("slot returns two types", ", ".join(names),
+                             ", ".join("%#x" % f for f in sorted(fns))))
+            for f in fns:
+                out.pop(f, None)
+    hints = set()
+    for root, fns in groups.items():
+        if any(f in facts and facts[f].sret for f in fns):
+            hints.update(f for f in fns if f in facts and not facts[f].sret)
+    # A slot function that hands its own this as the hidden buffer of a
+    # struct-returning virtual call on another object returns that struct.
+    for fn, ff in facts.items():
+        if ff.sret or fn not in group_of:
+            continue
+        for vc in ff.vcalls:
+            targets = by_site.get((fn, vc.insn), ())
+            if (vc.arg0 == (("this",), 0) and vc.root != ("this",) and targets
+                    and all(t in facts and facts[t].sret for t in targets)):
+                hints.add(fn)
+                break
+    if out or hints:
+        counts = [sum(1 for f in out if source.get(f) == how) for how in ("call", "forward", "slot")]
+        log("[oorecover] result types: %d methods returning a struct by value typed (%d by constructor or "
+            "member call, %d forwarded, %d by slot group), %d candidates undefined, %d slot mates to "
+            "re-collect as struct returns" % (len(out), counts[0], counts[1], counts[2], candidates, len(hints)))
+    return out, hints, findings
 
 
 MAX_PLAIN_MEMBER_GAP = 1 << 16

@@ -222,6 +222,39 @@ def check_namespaces(name, rep):
         assert "zoo::Counter* this" in v["caller_type"], (name, "Counter::bump lost its this", v["caller_type"])
 
 
+STRUCT_RETURNS = {"_ZN3zoo6Animal5labelEv": "struct zoo::Label(",       # built in the buffer by Label's constructor
+                  "_ZN3zoo3Dog5labelEv": "struct zoo::Label(",          # same slot, same type
+                  "_ZN3zoo5Puppy3posEv": "struct zoo::Puppy::pos_result("}   # copy only: placeholder kept
+# label2 forwards its buffer to label() on another object. The call carries
+# no MLIL parameters (rdi is passed through untouched) and its only caller
+# is virtual, so no fact names the object: the signature stays Binary
+# Ninja's own, never a wrong one.
+FORWARD_UNTYPED = ("_ZN3zoo6Animal6label2Ev", "struct zoo::Animal*(")
+# -O2 inlines Label's constructor, so every label writes the buffer itself
+# and nothing names the type: placeholders, one per slot.
+STRUCT_RETURNS_INLINED = {"_ZN3zoo6Animal5labelEv": "struct zoo::Animal::label_result(",
+                          "_ZN3zoo3Dog5labelEv": "struct zoo::Dog::label_result(",
+                          "_ZN3zoo5Puppy3posEv": "struct zoo::Puppy::pos_result("}
+
+
+def check_struct_returns(name, rep):
+    """Methods returning a struct by value carry the hidden-pointer return
+    location; the buffer names the result type when a constructor builds
+    it or when it is forwarded to a method whose result is known."""
+    if name not in SYMBOL_FIXTURES:
+        return
+    funcs = {v["name"]: v for c in rep["classes"] for v in c["functions"].values()}
+    expected = STRUCT_RETURNS_INLINED if name in FOLDED_FIXTURES else STRUCT_RETURNS
+    f = funcs.get(FORWARD_UNTYPED[0])
+    assert f is not None and f["type"].startswith(FORWARD_UNTYPED[1]), (name, "label2", f)
+    for sym, prefix in expected.items():
+        f = funcs.get(sym)
+        assert f is not None, (name, "struct-returning method not owned", sym)
+        assert f["type"].startswith(prefix), (name, sym, "return type", f["type"])
+        assert f["return_location"] and "*" in f["return_location"], (name, sym, f["return_location"])
+    assert not any(f["kind"] == "slot returns two types" for f in rep["findings"]), (name, rep["findings"])
+
+
 def check_puppy(name, rep):
     """Puppy::play reads its vtable through _base_Dog._base_Animal and calls
     fetch (slot 9, past Animal's and Dog's VTable) and kind; at -O2 gcc
@@ -242,11 +275,11 @@ def check_puppy(name, rep):
         assert len(play) == 2 and "_ZN3zoo5Puppy5fetchEv" in targets and any(t.endswith("4kindEv") for t in targets), \
             (name, "Puppy::play sites", play)
         return
-    # Without symbols: fetch and kind are the last two slots of the longest
-    # table; play and rest both reach fetch, play reaches kind.
+    # Without symbols: fetch and kind are the slots before pos, the last of
+    # the longest table; play and rest both reach fetch, play reaches kind.
     longest = max((t for c in rep["classes"] for t in c["vtables"].values()), key=lambda t: len(t["slots"]))
-    fetch = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-1]]]
-    kind = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-2]]]
+    fetch = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-2]]]
+    kind = [v for v in rep["vcalls"] if v["targets"] == [longest["slots"][-3]]]
     assert len(fetch) >= 2 and len(kind) >= 1, (name, "Puppy::play and rest sites to the last slots", fetch, kind)
 
 
@@ -259,8 +292,8 @@ def check_nortti(name):
     classes = rep["classes"]
     inlined = name in INLINED_CTORS
     # Header-less tables (MSVC without RTTI) sit back to back; the split at
-    # referenced slots must keep them apart: Puppy's table is the longest at 10.
-    assert max(len(t["slots"]) for c in classes for t in c["vtables"].values()) <= 10, \
+    # referenced slots must keep them apart: Puppy's table is the longest at 13.
+    assert max(len(t["slots"]) for c in classes for t in c["vtables"].values()) <= 13, \
         (name, "tables merged", [(c["name"], len(t["slots"])) for c in classes for t in c["vtables"].values()])
     assert not any(not c["vtables"] for c in classes), (name, "plain class in a stripped binary", [c["name"] for c in classes if not c["vtables"]])
     assert len(classes) >= 5, (name, [c["name"] for c in classes])
@@ -386,6 +419,7 @@ def main(argv):
                 check_rtti(name)
             check_namespaces(name, load(name))
             check_puppy(name, load(name))
+            check_struct_returns(name, load(name))
             print("ok  ", name)
         except AssertionError as e:
             failed += 1

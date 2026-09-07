@@ -92,6 +92,7 @@ class VirtualCall:
     root: tuple
     object_offset: int
     slot: int                # slot index within that sub-object's vtable
+    arg0: tuple = None       # (root, offset) of the first argument when it is not the object called on
 
 
 @dataclass

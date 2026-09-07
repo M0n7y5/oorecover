@@ -15,7 +15,7 @@ from binaryninja import MediumLevelILOperation as Op
 from binaryninja.enums import RegisterValueType, SymbolType, TypeClass, VariableSourceType
 
 from .facts import AllocCall, ArgPass, MemberAccess, ThisCall, VirtualCall, VtableInstall
-from .names import mangled, member, member_class, scan_scopes
+from .names import mangled, member, member_class, scan_scopes, symbol_role
 
 MAX_PASSES = 64
 MAX_ALLOC = 1 << 24
@@ -115,6 +115,28 @@ def _storage_after_return_buffer(func):
             return _arg_storage(func, indices.index(buf.storage) + 1)
         return _arg_storage(func, 1)
     return (_STACK, buf.storage + func.arch.address_size)
+
+
+def _buffer_storage(func):
+    """(source type, storage) of the calling convention's hidden return
+    buffer pointer."""
+    cc = func.calling_convention
+    if cc is None:
+        return _arg_storage(func, 0)
+    buf = cc.get_indirect_return_value_location()
+    return (buf.source_type, buf.storage)
+
+
+def _foreign_ctor(bv, func, callee):
+    """True when callee is by symbol a constructor of a class other than
+    the function's own: a method never rebuilds its own object as another
+    class, so the this it hands over is a struct returned by value."""
+    if symbol_role(bv, callee) != "ctor":
+        return False
+    cfunc = bv.get_function_at(callee)
+    own, theirs = member_class(bv, func), member_class(bv, cfunc) if cfunc is not None else None
+    return own is not None and theirs is not None and own != theirs
+
 
 
 def _returns_indirect(func):
@@ -432,6 +454,11 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
     pvars = list(func.parameter_vars)
     if pvars and pvars[0].name == "sret":
         facts.sret = True       # marking of releases before the native return location, kept one release
+    if facts.sret:
+        buffer = _buffer_storage(func)
+        for sv in entry:
+            if (sv.var.source_type, sv.var.storage) == buffer:
+                alias(_key(sv), ("sret",), 0)
     facts.entry_this = _reads_entry_this(func, ssa, entry)
     facts.member_of = member_class(bv, func)
     for index, keys in _param_keys(func, entry, MAX_PARAM_ROOTS).items():
@@ -653,7 +680,10 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
         if insn.operation in _VCALL_SITES:
             fp = slot_of(insn.dest)
             if fp is not None:
-                facts.vcalls.append(VirtualCall(func.start, insn.address, fp[0], fp[1], fp[2]))
+                arg0 = resolve(insn.params[0]) if insn.operation in _CALLS and insn.params else None
+                if arg0 == (fp[0], fp[1]):
+                    arg0 = None
+                facts.vcalls.append(VirtualCall(func.start, insn.address, fp[0], fp[1], fp[2], arg0))
 
     facts.reach = max([off for root, off in aliases.values() if root == ("this",)] + [0])
 
@@ -708,17 +738,20 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 if r is not None and r[1] >= 0:
                     facts.argpasses.append(ArgPass(func.start, insn.address, target, index, r[0], r[1]))
     _TIMES["rest"] += time.perf_counter() - t4
-    if not sret and func.start in slot_functions and not facts.installs and any(
-            a.root == ("this",) and a.offset == 0 and a.is_write for a in facts.accesses):
-        # A virtual method never writes its own vtable slot: the register it
-        # was keyed on holds a struct returned by value (sret); this is the
-        # next argument register.
+    if not sret and func.start in slot_functions and not facts.installs and (
+            any(a.root == ("this",) and a.offset == 0 and a.is_write for a in facts.accesses)
+            or any(c.root == ("this",) and c.offset == 0 and _foreign_ctor(bv, func, c.callee)
+                   for c in facts.calls)):
+        # A virtual method never writes its own vtable slot, nor builds
+        # another class over its own object: the register it was keyed on
+        # holds a struct returned by value (sret); this is the next argument
+        # register.
         again = collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator,
                                  debug, slot_functions, sret=True)
         if again is not None:
             again.sret = True
-            again.sret_size = max(a.offset + a.size for a in facts.accesses
-                                  if a.root == ("this",) and a.is_write)
+            again.sret_size = max([a.offset + a.size for a in facts.accesses
+                                   if a.root == ("this",) and a.is_write] + [0])
             return again
     return facts
 
@@ -795,7 +828,7 @@ _SEEN = set()   # functions the previous collect_all visited, facts or not
 
 
 def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, extra=(),
-                class_names=(), reuse=None, changed=(), changed_types=()):
+                class_names=(), reuse=None, changed=(), changed_types=(), sret_hints=()):
     """Facts per function. With reuse (the previous pass's facts) only the
     functions whose facts can differ are collected again: those retyped
     (changed), those taking a pointer to a class type defined or redefined
@@ -803,7 +836,8 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
     stores read), those whose scope gained or lost class evidence, the
     callers of all of these (call sites carry arguments only once the callee
     is typed), the construction sites in extra (the definitions retype their
-    objects) and functions not visited before; the rest keep their facts."""
+    objects) and functions not visited before; the rest keep their facts.
+    sret_hints are collected with the hidden return buffer keyed as such."""
     global _SEEN
     _CALLEE_PARAMS.clear()
     for phase in _TIMES:
@@ -827,7 +861,7 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
         callers = _callers(bv, retyped | flipped) & relevant
         t_callers = time.time() - t0
         new = relevant - _SEEN
-        todo = retyped | flipped | callers | (set(extra) & relevant) | new
+        todo = retyped | flipped | callers | ((set(extra) | set(sret_hints)) & relevant) | new
         pending = sorted(todo)
         result = {addr: f for addr, f in reuse.items() if addr not in todo}
         log("[oorecover] re-collecting %d of %d relevant functions (%d retyped or taking a redefined "
@@ -855,7 +889,8 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
             continue
         try:
             f = collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator,
-                                 log if func.start in debug_funcs else None, slot_functions)
+                                 log if func.start in debug_funcs else None, slot_functions,
+                                 sret=addr in sret_hints)
         except Exception:
             failed += 1
             if failed <= 5:

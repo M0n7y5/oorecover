@@ -1,4 +1,5 @@
 """Mangled and qualified name helpers shared by the collector and the applier."""
+import re
 import time
 
 from binaryninja.enums import TypeClass, VariableSourceType
@@ -10,6 +11,95 @@ _SCOPES = (None, {}, frozenset())
 _ARITY = (None, {})   # per view: function start -> reads one argument register past its explicit list
 META_TYPES = "oorecover.types"    # metadata key listing the types a run of ours defined
 _REGISTER = VariableSourceType.RegisterVariableSourceType
+_MARKER = re.compile(r"(C[123]|D[012])E")
+
+
+def _skip_ident(raw, pos):
+    m = re.match(r"\d+", raw[pos:])
+    return pos + len(m.group(0)) + int(m.group(0))
+
+
+_STD_ABBREV = "tabsiod"
+
+
+def _skip_substitution(raw, pos):
+    """S_ / S<seq>_ substitutions and the two-letter St/Sa/Sb/Ss/Si/So/Sd forms."""
+    if pos + 1 < len(raw) and raw[pos + 1] in _STD_ABBREV:
+        return pos + 2
+    end = raw.find("_", pos)
+    return len(raw) if end < 0 else end + 1
+
+
+def _skip_group(raw, pos):
+    """Skip a group opened at pos by I (template args) or N (nested name) or
+    L (literal) up to and including its closing E, honouring length-prefixed
+    identifiers, which may contain E/I/N."""
+    depth = 0
+    while pos < len(raw):
+        ch = raw[pos]
+        if ch.isdigit():
+            pos = _skip_ident(raw, pos)
+        elif ch in "INL":
+            depth += 1
+            pos += 1
+            if ch == "L" and raw.startswith("_Z", pos):
+                pos += 2
+        elif ch == "E":
+            depth -= 1
+            pos += 1
+            if depth == 0:
+                return pos
+        elif ch == "S":
+            pos = _skip_substitution(raw, pos)
+        else:
+            pos += 1
+    return pos
+
+
+def _skip_template_args(raw, pos):
+    return _skip_group(raw, pos)
+
+
+def _itanium_role(raw):
+    """Walk the nested-name components of a mangled name; constructor and
+    destructor markers are the only components without a length prefix."""
+    if not raw.startswith("_ZN"):
+        return None
+    pos = 3
+    while pos < len(raw):
+        ch = raw[pos]
+        if ch.isdigit():
+            pos = _skip_ident(raw, pos)
+            continue
+        m = _MARKER.match(raw, pos)
+        if m:
+            return "ctor" if m.group(1)[0] == "C" else "dtor"
+        if ch == "I":
+            pos = _skip_template_args(raw, pos)
+            continue
+        if raw.startswith("St", pos) or ch in "KVr":
+            pos += 2 if raw.startswith("St", pos) else 1
+            continue
+        if ch == "S":
+            pos = _skip_substitution(raw, pos)
+            continue
+        return None
+    return None
+
+
+def symbol_role(bv, addr):
+    """'ctor' or 'dtor' when the function's mangled name says so, else None."""
+    sym = bv.get_symbol_at(addr)
+    if sym is None:
+        return None
+    raw = sym.raw_name
+    if raw.startswith("_Z"):
+        return _itanium_role(raw)
+    if raw.startswith("??0"):
+        return "ctor"
+    if raw.startswith(("??1", "??_G", "??_E")):
+        return "dtor"
+    return None
 
 
 def _hidden_this(func):

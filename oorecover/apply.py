@@ -294,19 +294,27 @@ def _default_locations(params):
     return [FunctionParameter(p.type, p.name) for p in params]
 
 
-def _indirect_return(bv, func, ftype, name, size, own):
+def _indirect_return(bv, func, ftype, name, size, own, result=None, replaced=None):
     """Return value of a method returning a struct by value through the
     calling convention's hidden pointer, so Binary Ninja lays this out in
-    the next argument register and shows the buffer as the result. Binary
-    Ninja's return type is kept when it already is a struct; otherwise a
+    the next argument register and shows the buffer as the result. With
+    result, the model's class for the buffer, the return is that struct and
+    the method's placeholder, if any, is listed in replaced. Otherwise
+    Binary Ninja's return type is kept when it already is a struct, else a
     placeholder named after the method spans the writes into the buffer."""
-    if _is_indirect(ftype):
-        return ReturnValue(ftype.return_value, ftype.return_value_location)
     rtype = ftype.return_value
-    is_struct = (rtype.type_class == TypeClass.StructureTypeClass
-                 or (rtype.type_class == TypeClass.NamedTypeReferenceClass
-                     and rtype.named_type_class in _STRUCT_REFS))
-    if not is_struct:
+    current = str(rtype.name) if rtype.type_class == TypeClass.NamedTypeReferenceClass else None
+    if result is not None:
+        if _is_indirect(ftype) and current == result:
+            return ReturnValue(rtype, ftype.return_value_location)
+        if replaced is not None and name + "_result" in own:
+            replaced.add(name + "_result")
+        rtype = _named_type(result)
+    elif _is_indirect(ftype):
+        return ReturnValue(rtype, ftype.return_value_location)
+    elif not (rtype.type_class == TypeClass.StructureTypeClass
+              or (rtype.type_class == TypeClass.NamedTypeReferenceClass
+                  and rtype.named_type_class in _STRUCT_REFS)):
         placeholder = name + "_result"
         if bv.get_type_by_name(qualified(placeholder)) is None or placeholder in own:
             sb = StructureBuilder.create()
@@ -567,10 +575,14 @@ def apply_instances(bv, instances, defined, log=print):
 
 
 def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium", param_classes=None,
-                facts=None, unowned=(), instances=None, retyped=None, retyped_types=None):
+                facts=None, unowned=(), instances=None, retyped=None, retyped_types=None,
+                result_types=None):
     """Define the recovered types and signatures. retyped and retyped_types,
     when given, receive the starts of every function whose signature changed
-    and the names of every class type defined or redefined."""
+    and the names of every class type defined or redefined. result_types
+    maps methods returning a struct by value to the class of that struct."""
+    result_types = result_types or {}
+    replaced = set()    # <Class>::<method>_result placeholders superseded by a real struct
     arch = bv.arch
     ptrsize = bv.address_size
     void_ptr = Type.pointer(arch, Type.void())
@@ -702,7 +714,8 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                         own_functions.add(fn)
                     ftype = func.type
                     params = list(ftype.parameters)
-                    sret = bool(facts) and fn in facts and facts[fn].sret
+                    result = result_types.get(fn)
+                    sret = result is not None or (bool(facts) and fn in facts and facts[fn].sret)
                     if params and params[0].name == "sret":
                         params = params[1:]     # marking of releases before the native return location
                     has_this = bool(params) and params[0].name == "this"
@@ -742,7 +755,8 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                     if sret:
                         ret = _indirect_return(bv, func, ftype,
                                                cls.name + "::" + _slot_label(func, slot_index.get(fn, 0)),
-                                               facts[fn].sret_size, own)
+                                               facts[fn].sret_size if fn in facts else 0, own,
+                                               result, replaced)
                         rest = _default_locations(rest)
                     new_type = Type.function(
                         ret, lead + rest,
@@ -784,7 +798,7 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                 except Exception as e:
                     failures += 1
                     log("[oorecover] vtable var %s failed: %s" % (sym_name, e))
-        for name in sorted(stale):
+        for name in sorted(stale | replaced):
             try:
                 bv.undefine_user_type(qualified(name))
                 own.discard(name)
@@ -822,7 +836,9 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
         bv.commit_undo_actions(undo)
     log("[oorecover] applied %d class types (%d failures, %d functions gained a this parameter, "
         "%d signatures repaired from mangled names, %d mismatches kept, %d signatures retyped, "
-        "%d left as they were, %d types unchanged); apply %.1fs, reanalysis %.1fs"
+        "%d left as they were, %d types unchanged, %d struct returns typed, %d placeholders replaced); "
+        "apply %.1fs, reanalysis %.1fs"
         % (len(defined), failures, newly_typed, repaired, kept, len(changed.starts), changed.identical,
-           changed.identical_types, t_apply - t_start, t_reanalysis - t_apply))
+           changed.identical_types, len(result_types), len(replaced), t_apply - t_start,
+           t_reanalysis - t_apply))
     return newly_typed + namespaces

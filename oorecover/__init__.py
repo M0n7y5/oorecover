@@ -19,7 +19,8 @@ from .scan import scan_vtables
 
 class Result:
     __slots__ = ("abi", "tables", "facts", "classes", "functions_added", "vcalls", "native",
-                 "param_classes", "earlier_vcalls", "findings", "unowned", "instances")
+                 "param_classes", "earlier_vcalls", "findings", "unowned", "instances", "result_types",
+                 "sret_hints")
 
     def __init__(self, abi, tables, facts, classes, functions_added, vcalls=(), native=None,
                  param_classes=None, notes=None):
@@ -36,6 +37,8 @@ class Result:
         self.findings = list(notes.get("findings", ()))   # contradictions withdrawn by validation
         self.unowned = dict(notes.get("unowned", {}))     # shared implementation -> its unrelated classes
         self.instances = dict(notes.get("instances", {}))  # static object address -> class name
+        self.result_types = dict(notes.get("result_types", {}))  # method -> class of the struct it returns
+        self.sret_hints = set(notes.get("sret_hints", ()))   # slot mates of struct returns, collected as such next
 
 
 def trace_functions(bv, starts, log=print, callers=False):
@@ -78,7 +81,7 @@ def trace_functions(bv, starts, log=print, callers=False):
 
 
 def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_names=(),
-        reuse=None, changed=(), changed_types=()):
+        reuse=None, changed=(), changed_types=(), sret_hints=()):
     cancelled = cancelled or (lambda: False)
     if progress:
         progress("waiting for analysis")
@@ -102,7 +105,7 @@ def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_
         mem = Memory(bv)
     t2 = time.time()
     facts = collect_all(bv, mem, abi, tables, log, progress, cancelled, extra_functions,
-                        class_names, reuse, changed, changed_types)
+                        class_names, reuse, changed, changed_types, sret_hints)
     if cancelled():
         return None
     t3 = time.time()
@@ -143,7 +146,8 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
             first = run(bv, log, progress, cancelled)
             if first is not None and first.classes:
                 apply_model(bv, first.classes, log, progress, first.vcalls, first.abi,
-                            first.param_classes, first.facts, first.unowned, first.instances)
+                            first.param_classes, first.facts, first.unowned, first.instances,
+                            result_types=first.result_types)
         trace_functions(bv, starts, log, callers="callers" in words)
         return Result("trace", [], {}, [], 0)
     result = None
@@ -153,8 +157,10 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
     reuse = None
     retyped = set()
     retyped_types = set()
+    sret_hints = set()
     for n in range(2):
-        result = run(bv, log, progress, cancelled, extra, class_names, reuse, retyped, retyped_types)
+        result = run(bv, log, progress, cancelled, extra, class_names, reuse, retyped, retyped_types,
+                     sret_hints)
         if result is None:
             log("[oorecover] cancelled")
             return None
@@ -167,7 +173,7 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
         retyped_types = set()
         newly_typed = apply_model(bv, result.classes, log, progress, result.vcalls, result.abi,
                                   result.param_classes, result.facts, result.unowned,
-                                  result.instances, retyped, retyped_types)
+                                  result.instances, retyped, retyped_types, result.result_types)
         if len(result.tables) <= 16:
             final = vtable_snapshot(bv, result.tables)
             for addr, info in sorted(final["tables"].items()):
@@ -183,7 +189,8 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
         for (faddr, _index) in result.param_classes:
             if faddr not in result.facts:
                 extra.add(faddr)
-        if newly_typed == 0 and len(extra) == before:
+        sret_hints |= result.sret_hints
+        if newly_typed == 0 and len(extra) == before and not result.sret_hints:
             break
         if n == 1:
             log("[oorecover] pass 2 done; %d functions discovered late, not visited" % (len(extra) - before))
