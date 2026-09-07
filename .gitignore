@@ -9,6 +9,7 @@ tests/*.o
 tests/autotest.txt
 tests/trace.txt
 tests/reanalyze.txt
+tests/decompile.txt
 tests/debug_funcs.txt
 __pycache__/
 *.pyc

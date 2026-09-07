@@ -4,6 +4,8 @@ import time
 
 import importlib
 
+from binaryninja.lineardisassembly import LinearViewCursor, LinearViewObject
+
 from . import validate
 # The entry point's reload list predates this module; until Binary Ninja
 # restarts it is refreshed here, after model (which calls through the module).
@@ -122,6 +124,23 @@ def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_
 _TESTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
 _TRACE_FILE = os.path.join(_TESTS, "trace.txt")
 _REANALYZE_FILE = os.path.join(_TESTS, "reanalyze.txt")
+_DECOMPILE_FILE = os.path.join(_TESTS, "decompile.txt")
+
+
+def decompile_text(bv, start):
+    """The function's Pseudo C as the linear view renders it: the signature
+    line and the body, one string."""
+    func = bv.get_function_at(start)
+    if func is None:
+        return "no function at 0x%x" % start
+    cursor = LinearViewCursor(LinearViewObject.single_function_language_representation(func))
+    lines = []
+    while True:
+        chunk = bv.get_next_linear_disassembly_lines(cursor)
+        if not chunk:
+            break
+        lines.extend(str(line) for line in chunk)
+    return "\n".join(lines)
 
 
 def run_and_apply(bv, log=print, progress=None, cancelled=None):
@@ -148,6 +167,16 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
                             result_types=first.result_types)
         trace_functions(bv, starts, log, callers="callers" in words)
         return Result("trace", [], {}, [], 0)
+    # tests/decompile.txt: "0xADDR [label]" lines; the function text before and
+    # after recovery goes to tests/reports/<basename>.decompile.md.
+    decompile = []
+    if os.path.isfile(_DECOMPILE_FILE):
+        with open(_DECOMPILE_FILE) as f:
+            for line in f:
+                words = line.split()
+                if words and words[0].startswith("0x"):
+                    decompile.append((int(words[0], 0), " ".join(words[1:]) or words[0]))
+    captured = {start: decompile_text(bv, start) for start, _label in decompile}
     result = None
     extra = set()
     class_names = set()
@@ -195,4 +224,10 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
             "%d new functions to visit; rerunning on the changed functions and their callers, "
             "reusing the other facts" % (n + 1, newly_typed, len(retyped), len(retyped_types),
                                          len(extra) - before))
+    if decompile:
+        out = os.path.join(_TESTS, "reports", os.path.basename(bv.file.filename) + ".decompile.md")
+        with open(out, "w") as f:
+            for start, label in decompile:
+                f.write("## %s\n\nbefore\n\n```c\n%s\n```\n\nafter\n\n```c\n%s\n```\n\n"
+                        % (label, captured[start], decompile_text(bv, start)))
     return result
