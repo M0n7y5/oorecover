@@ -27,7 +27,7 @@ from . import validate
 class ClassModel:
     __slots__ = ("name", "typeinfo", "has_rtti", "vtables", "methods", "thunks",
                  "ctors", "dtors", "members", "bases", "size", "sites", "plain", "shared",
-                 "embedded", "site_functions", "construction")
+                 "embedded", "site_functions", "construction", "nonvirtual")
 
     def __init__(self, name, typeinfo=None, plain=False):
         self.name = name
@@ -44,6 +44,7 @@ class ClassModel:
         self.members = {}      # offset -> [size, hint, writes, reads]
         self.embedded = {}     # offset -> class of a member object built there
         self.construction = {} # derived class -> {offset: VtableInfo}: its construction vtables for this class
+        self.nonvirtual = set() # unnamed functions attributed by the objects callers pass as this
         self.bases = []        # [BaseRef]
         self.size = 0
         self.sites = 0         # construction sites seen
@@ -83,7 +84,7 @@ class ClassModel:
         return max(self.size, end)
 
     def owns(self):
-        return self.methods | self.ctors | self.dtors
+        return self.methods | self.ctors | self.dtors | self.nonvirtual
 
 
 def ancestors(cls, by_name, depth=0):
@@ -675,8 +676,12 @@ def build_model(bv, mem, tables, facts, log=print):
     findings += validate.check_structure(topo_order(classes), alloc_sizes,
                                 lambda c: c.extent(ptrsize, by_name), log)
 
+    exact_keys = set()
+    full = {}
     vcalls, param_classes = resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log,
-                                                  unowned)
+                                                  unowned, exact_keys, full)
+    attribute_nonvirtual(bv, classes, facts, claimed, full, exact_keys, by_name,
+                         {fn for t in tables for fn in t.functions}, ptrsize, log)
     if len(vcalls) <= 12:
         for caller, insn, cls_name, exact, targets in vcalls:
             log("[oorecover]   vcall %#x in %#x: %s%s -> %s" % (
@@ -922,7 +927,8 @@ def base_offset_in(derived, base, by_name, depth=0):
     return None
 
 
-def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print, unowned=()):
+def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print, unowned=(),
+                          exact_keys=None, full=None):
     """Resolve indirect calls through vtables to their implementations.
 
     Returns [(caller, insn, static class name, exact, [targets])]. A call
@@ -949,7 +955,7 @@ def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print
 
     site_class = {(faddr, root): cls for faddr, root, cls in sites}
     param_class = infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log,
-                                      unowned)
+                                      unowned, exact_keys)
     def targets_for(cls, vc, exact):
         table = cls.vtables.get(vc.object_offset)
         if table is None or vc.slot >= len(table.slots):
@@ -1019,16 +1025,70 @@ def resolve_virtual_calls(bv, classes, facts, claimed, sites, by_name, log=print
         for (faddr, index), (cls, source, alt) in sorted(param_class.items()):
             log("[oorecover]   param %#x:%d -> %s (%s%s)" % (
                 faddr, index, cls.name, source, ", callers pass " + alt.name if alt else ""))
+    if full is not None:
+        full.update(param_class)
     return resolved, inferred
 
 
-def infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log=print, unowned=()):
+def attribute_nonvirtual(bv, classes, facts, claimed, param_classes, exact_keys, by_name, slot_functions,
+                         ptrsize, log=print):
+    """Own unnamed functions whose first parameter every caller resolves
+    to objects of one class C (the argument-passing inference, unwidened),
+    some caller with an exact object (built at the site, a static instance,
+    or the this of an owned method), and that read or write a member of
+    that object past its vtable pointer. A function that only calls
+    virtuals through the object, or hands it on, is what a free function
+    taking a C* does too, so it is not claimed, and neither is one whose
+    reads sit under a speculative devirtualisation guard (facts.guarded):
+    those belong to the inlined callee. Slot functions, thunks, structors
+    (they write the vtable pointer) and functions a class already owns are
+    left alone; a declared type alone is no evidence."""
+    owner_of = {fn: cls for cls in classes for fn in cls.owns()}
+    try:
+        ours = {int(v) for v in bv.query_metadata("oorecover.functions")}
+    except Exception:
+        ours = set()
+    named = 0
+    for (fn, index), (cls, source, alt) in sorted(param_classes.items()):
+        # Argument passing must name the class, by itself or beside a type
+        # an earlier pass applied from it; the type alone is no evidence.
+        passed = source == "argpass" or (alt is not None and (alt is cls or derives_from(alt, cls, by_name)))
+        if not passed or index != 0 or (fn, index) not in exact_keys or fn in claimed or fn in owner_of:
+            continue
+        if fn in slot_functions or fn not in facts:
+            continue
+        func = bv.get_function_at(fn)
+        if func is None or symbol_thunk_shift(bv, fn) is not None:
+            continue
+        if func.symbol is not None and not func.symbol.short_name.startswith("sub_") and fn not in ours:
+            continue
+        ff = facts[fn]
+        root = ("this",)    # the collector keys an untyped function's first register so
+        if any(a.root == root and a.offset == 0 and a.is_write for a in ff.accesses) or ff.installs:
+            continue        # writes its vptr: a constructor or destructor, the structor logic's business
+        if ff.guarded:
+            continue        # member reads under a devirtualisation guard belong to the inlined callee
+        if not any(a.root == root and a.offset >= ptrsize for a in ff.accesses):
+            continue
+        cls.nonvirtual.add(fn)
+        claimed[fn] = cls
+        owner_of[fn] = cls
+        named += 1
+    if named:
+        log("[oorecover] %d non-virtual functions named after the class they take" % named)
+    return named
+
+
+def infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log=print, unowned=(),
+                        exact_keys=None):
     """(function, parameter index) -> (class, source, alt) for parameters
     that point to a known class: from the Binary Ninja signature when it
     names one ("type"), else from the objects callers pass in ("argpass"),
     taking the common ancestor of every root class observed. alt is the
-    argpass class when the signature already named one."""
+    argpass class when the signature already named one. exact_keys, when
+    given, receives the keys some caller passes an exact object to."""
     out = {}
+    exact_keys = set() if exact_keys is None else exact_keys
     for faddr, ff in facts.items():
         if not ff.vcalls:
             continue
@@ -1088,14 +1148,21 @@ def infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log=pr
                 continue
             cls = root_class(faddr, ap.root, ap.offset)
             if cls is not None:
-                candidates.setdefault((ap.callee, ap.index), []).append(cls)
+                # An object built at the site, a static instance or the this
+                # of an owned method is exactly that class; a parameter only
+                # holds what its own callers pass.
+                exact = ap.root[0] in ("alloc", "stack", "global") or (
+                    ap.root == ("this",) and faddr in claimed)
+                candidates.setdefault((ap.callee, ap.index), []).append((cls, exact))
     for key, cands in candidates.items():
-        for c in cands:
-            if all(d is c or derives_from(d, c, by_name) for d in cands):
+        for c, _exact in cands:
+            if all(d is c or derives_from(d, c, by_name) for d, _e in cands):
                 if key in out:
                     out[key] = (out[key][0], out[key][1], c)
                 else:
                     out[key] = (c, "argpass", None)
+                if any(e for _d, e in cands):
+                    exact_keys.add(key)
                 break
     return out
 

@@ -27,7 +27,7 @@ def build_report(bv, result):
     classes = []
     for c in result.classes:
         funcs = {}
-        for fn in sorted(c.methods | c.ctors | c.dtors | set(c.thunks) | set(c.shared)):
+        for fn in sorted(c.methods | c.ctors | c.dtors | c.nonvirtual | set(c.thunks) | set(c.shared)):
             f = bv.get_function_at(fn)
             if f is not None:
                 funcs["%#x" % fn] = {"name": f.name, "type": str(f.type),
@@ -42,6 +42,7 @@ def build_report(bv, result):
                                              for s in t.slots]}
                         for off, t in sorted(c.vtables.items())},
             "methods": ["%#x" % fn for fn in sorted(c.methods)],
+            "nonvirtual": ["%#x" % fn for fn in sorted(c.nonvirtual)],
             "ctors": ["%#x" % fn for fn in sorted(c.ctors)],
             "dtors": ["%#x" % fn for fn in sorted(c.dtors)],
             "thunks": {"%#x" % fn: off for fn, off in sorted(c.thunks.items())},

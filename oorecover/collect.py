@@ -30,6 +30,7 @@ _FIELD_SETS = (Op.MLIL_SET_VAR_SSA_FIELD, Op.MLIL_SET_VAR_ALIASED_FIELD)
 _FIELD_VARS = (Op.MLIL_VAR_SSA_FIELD, Op.MLIL_VAR_ALIASED_FIELD)
 _CALLS = (Op.MLIL_CALL_SSA, Op.MLIL_TAILCALL_SSA)
 _VCALL_SITES = _CALLS + (Op.MLIL_JUMP,)
+_EQ_CMPS = (Op.MLIL_CMP_E, Op.MLIL_CMP_NE)
 _LOADS = (Op.MLIL_LOAD_SSA, Op.MLIL_LOAD_STRUCT_SSA)
 _STORES = (Op.MLIL_STORE_SSA, Op.MLIL_STORE_STRUCT_SSA)
 _TIMES = {"il": 0.0, "vars": 0.0, "walk": 0.0, "alias": 0.0, "rest": 0.0}   # per pass, seconds
@@ -38,7 +39,7 @@ _TIMES = {"il": 0.0, "vars": 0.0, "walk": 0.0, "alias": 0.0, "rest": 0.0}   # pe
 class FunctionFacts:
     __slots__ = ("address", "installs", "accesses", "calls", "allocs", "stack_accesses",
                  "tail_target", "vcalls", "reach", "argpasses", "entry_this", "member_of",
-                 "sret", "sret_size")
+                 "sret", "sret_size", "guarded")
 
     def __init__(self, address):
         self.address = address
@@ -55,6 +56,7 @@ class FunctionFacts:
         self.member_of = None     # class the mangled symbol places it in, if any (names.member_class)
         self.sret = False         # returns a struct by value: this follows the hidden buffer
         self.sret_size = 0        # extent of the writes into that buffer
+        self.guarded = False      # compares a vtable slot with a function: speculative devirtualisation
 
     def empty(self):
         return not (self.installs or self.accesses or self.calls or self.allocs
@@ -740,6 +742,16 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
                 if arg0 == (fp[0], fp[1]):
                     arg0 = None
                 facts.vcalls.append(VirtualCall(func.start, insn.address, fp[0], fp[1], fp[2], arg0))
+        if not facts.guarded and insn.operation == Op.MLIL_IF:
+            # gcc's speculative devirtualisation: a slot compared with the
+            # function it expects, the callee's body inlined on the equal
+            # branch. Member reads under it are the callee's, not this one's.
+            cond = insn.condition
+            if cond.operation in _EQ_CMPS:
+                for a, b in ((cond.left, cond.right), (cond.right, cond.left)):
+                    if _call_target(bv, b) is not None and slot_of(a) is not None:
+                        facts.guarded = True
+                        break
 
     facts.reach = max([off for root, off in aliases.values() if root == ("this",)] + [0])
 

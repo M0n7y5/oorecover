@@ -293,6 +293,43 @@ def check_construction(name, rep):
     assert len(cat["vtables"]) == 2, (name, "Cat's own tables", cat["vtables"])
 
 
+# Non-virtual members by address on the stripped copy of testprog (same
+# code layout), from testprog.json: Animal::rate reads age through its
+# object; Puppy::play and rest only call virtuals, as use() does, so they
+# stay unnamed; Stats and Counter exist only by symbol here.
+NONVIRTUAL = {"testprog_stripped": {"0x4021dc": "zoo::Animal"},
+              "testprog32": {"0x1120e": "zoo::Animal"},
+              "testprog_msvc64.exe": {"0x140001004": "zoo::Animal"},
+              "testprog_msvc32.exe": {"0x401004": "zoo::Animal"}}
+FREE_FUNCTIONS = {"testprog_stripped": ("0x40226a", "0x402294", "0x4022a3", "0x402321", "0x4022c7", "0x4022ed"),
+                  "testprog32": ("0x112a8", "0x112cb", "0x112dc", "0x1135f", "0x1130a", "0x11330"),
+                  # -O2: speculative devirtualisation inlines callee bodies under
+                  # type guards, so every function reading members through its
+                  # parameter is guarded, Animal::rate included: nothing is named.
+                  "testprog_o2": ("0x4026e0", "0x402720", "0x402750", "0x402820", "0x402790", "0x4027d0",
+                                  "0x402610", "0x402680")}
+
+
+def check_nonvirtual(name, rep):
+    """Unnamed functions every caller hands an object of one class, some
+    of them exact, and that read a member of it are that class's methods:
+    named method_<address>, typed with this, listed under the class. Free
+    functions taking the object (use, measure, flapit, labels, zoo::feed,
+    zoo::where) are not."""
+    if name not in NONVIRTUAL and name not in FREE_FUNCTIONS:
+        return
+    cmap = {c["name"]: c for c in rep["classes"]}
+    claimed = {fn: c["name"] for c in rep["classes"] for fn in c["nonvirtual"]}
+    for fn, cls in NONVIRTUAL.get(name, {}).items():
+        assert claimed.get(fn) == cls, (name, fn, "expected under", cls, "got", claimed.get(fn))
+        f = cmap[cls]["functions"][fn]
+        assert f["name"] == "%s::method_%s" % (cls, fn[2:]), (name, f["name"])
+        assert f["type"].split("(", 1)[1].startswith("struct %s* this" % cls), (name, f["type"])
+    for fn in FREE_FUNCTIONS.get(name, ()):
+        assert fn not in claimed, (name, "free function claimed", fn, claimed[fn])
+    assert not (set(claimed) - set(NONVIRTUAL.get(name, {}))), (name, "unexpected attributions", claimed)
+
+
 def check_puppy(name, rep):
     """Puppy::play reads its vtable through _base_Dog._base_Animal and calls
     fetch (slot 9, past Animal's and Dog's VTable) and kind; at -O2 gcc
@@ -459,6 +496,7 @@ def main(argv):
             check_puppy(name, load(name))
             check_struct_returns(name, load(name))
             check_construction(name, load(name))
+            check_nonvirtual(name, load(name))
             print("ok  ", name)
         except AssertionError as e:
             failed += 1

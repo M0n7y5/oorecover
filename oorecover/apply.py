@@ -738,6 +738,8 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                 jobs.append((fn, "dtor" if i == 0 else "dtor_%d" % i, cls_ptr))
             for fn in sorted(cls.methods):
                 jobs.append((fn, "vfunc_%d" % slot_index.get(fn, 0), cls_ptr))
+            for fn in sorted(cls.nonvirtual):
+                jobs.append((fn, "method_%x" % fn, cls_ptr))
             for fn, off in sorted(cls.thunks.items()):
                 jobs.append((fn, "thunk_%x_%d" % (off, slot_index.get(fn, 0)), base_ptr_at(off)))
             for fn, slot in sorted(cls.shared.items()):
