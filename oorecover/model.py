@@ -692,10 +692,11 @@ def build_model(bv, mem, tables, facts, log=print):
                     cls.embedded[off] = target.name
 
     # A holder stores an object pointer whole into a base or embedded
-    # object's member that the object's own accesses show narrower (a
-    # pointer wrapper touched by halves inside): same memory, so the member
-    # is that wide. A wider constant store proves nothing (it may cover
-    # padding or a neighbour). Holders first, so nested objects follow.
+    # object's member that the object's own accesses show narrower or
+    # untyped (a pointer wrapper touched by halves inside): same memory,
+    # so the member is a pointer that wide. A wider constant store proves
+    # nothing (it may cover padding or a neighbour). Holders first, so
+    # nested objects follow.
     whole = set()    # (holder, offset) of pointer-sized stores of an object root
     for cls in classes:
         for fn in cls.owns():
@@ -719,11 +720,11 @@ def build_model(bv, mem, tables, facts, log=print):
                 continue
             for off, m in cls.members.items():
                 inner = sub.members.get(off - start)
-                if inner is not None and inner[0] < ptrsize and (cls.name, off) in whole:
-                    inner[0] = ptrsize
+                if inner is not None and (cls.name, off) in whole and inner[:2] != [ptrsize, "ptr"]:
+                    inner[:2] = [ptrsize, "ptr"]
                     widened += 1
     if widened:
-        log("[oorecover] %d embedded members widened to the holder's pointer stores" % widened)
+        log("[oorecover] %d embedded members are pointers the holder stores whole" % widened)
 
     findings += validate.check_structure(topo_order(classes), alloc_sizes,
                                 lambda c: c.extent(ptrsize, by_name), log)

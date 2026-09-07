@@ -695,7 +695,12 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                 if off < prev_end:
                     continue
                 size, hint, _w, _r = cls.members[off]
-                limit = offsets[i + 1] if i + 1 < len(offsets) else None
+                pointee = cls.member_classes.get(off)
+                # A known pointer (a stored object or mapped address) keeps
+                # its width over the partial accesses recorded inside it;
+                # anything else ends where the next member starts.
+                whole = size == ptrsize and (pointee is not None or hint == "ptr")
+                limit = offsets[i + 1] if i + 1 < len(offsets) and not whole else None
                 for b in bounds:
                     if b > off and (limit is None or b < limit):
                         limit = b
@@ -703,7 +708,6 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                     size = limit - off
                     if size != ptrsize:
                         hint = "int"
-                pointee = cls.member_classes.get(off)
                 if pointee is not None and size == ptrsize:
                     sb.insert(off, _named_ptr(bv, pointee), "m_%x" % off)
                 else:
