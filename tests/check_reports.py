@@ -4,6 +4,7 @@ Usage: python3 check_reports.py [fixture ...]   (default: every report present)
 """
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -14,6 +15,8 @@ RTTI_FIXTURES = ("testprog", "testprog_stripped", "testprog32",
 NORTTI_FIXTURES = ("testprog_nortti", "testprog_o2", "testprog_msvc64_nortti.exe")
 NAMED_NORTTI_FIXTURES = ("testprog_nortti_sym", "testprog_nortti_novt")
 FOLDED_FIXTURES = ("testprog_icf",)
+# Itanium fixtures with function symbols: zoo::feed is typed from its name.
+SYMBOL_FIXTURES = ("testprog", "testprog_nortti_sym", "testprog_nortti_novt", "testprog_icf")
 
 
 def load(name):
@@ -194,6 +197,24 @@ def check_coexistence(name, rep, allowed_findings=()):
     assert not stray, (name, "VTable types not on any table", stray)
 
 
+def check_namespaces(name, rep):
+    """A namespace is not a class: no report has a class named zoo (or any
+    scope another class nests in), and the free function zoo::feed keeps
+    exactly the parameters its mangled name lists, no this."""
+    names = [c["name"] for c in rep["classes"]]
+    scopes = [n for n in names if any(o.startswith(n + "::") for o in names)]
+    assert "zoo" not in names and not scopes, (name, "namespace taken for a class", scopes or names)
+    if name not in SYMBOL_FIXTURES:
+        return
+    feed = [v for v in rep["vcalls"] if v["caller_name"] == "_ZN3zoo4feedEPNS_6AnimalEi"]
+    assert feed, (name, "zoo::feed's virtual calls unresolved")
+    for v in feed:
+        assert v["class"] == "zoo::Animal", (name, "zoo::feed call not through Animal*", v)
+        params = v["caller_type"].split("(", 1)[1]
+        assert re.fullmatch(r"(struct )?zoo::Animal\* \w+, int32_t \w+\)", params), \
+            (name, "zoo::feed signature", v["caller_type"])
+
+
 INLINED_CTORS = ("testprog_o2", "testprog_msvc64_nortti.exe")
 
 
@@ -328,6 +349,7 @@ def main(argv):
                 check_folded(name)
             else:
                 check_rtti(name)
+            check_namespaces(name, load(name))
             print("ok  ", name)
         except AssertionError as e:
             failed += 1

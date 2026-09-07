@@ -120,6 +120,9 @@ public:
     int id;
     Stats stats;    // an embedded object, built by the constructor at this+16
 };
+// A namespace-scope free function: Binary Ninja 6.0 types it from the
+// mangled name with a bogus zoo* this in front of the real parameters.
+NOINLINE int feed(Animal* a, int n) { return a->speak() * n + a->legs(); }
 }
 zoo::Beacon g_beacon;
 
@@ -151,7 +154,7 @@ int main() {
     zoo::Info inf2 = heap->info2(2, 3);
     int r = use(&an) + use(&d) + use(&b) + use(heap) + use(cat) + measure(&sq) + w.span + hs + an.describe() + an.rate(3) + heap->rate(2) + g_beacon.ping() + (int)inf.v[3] + (int)inf2.v[1];
     zoo::Stats st(r);
-    r += st.bump(2) + st.bump(3);
+    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3);
     delete heap;
     delete cat;
     return r;

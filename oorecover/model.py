@@ -19,7 +19,7 @@ import re
 from binaryninja.enums import TypeClass
 
 from .facts import BaseRef
-from .names import mangled_class
+from .names import mangled_class, member
 from . import validate
 
 _MARKER = re.compile(r"(C[123]|D[012])E")
@@ -939,10 +939,8 @@ def infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log=pr
             params = list(func.type.parameters)
         except Exception:
             continue
-        sym = func.symbol
-        mangled = sym is not None and sym.raw_name.startswith(("_Z", "?"))
         # Pre-6.0 demangled member signatures omit this: declared i is argument i+1.
-        shift = 1 if mangled and not (params and params[0].name == "this") else 0
+        shift = 1 if member(bv, func) and not (params and params[0].name == "this") else 0
         for at, p in enumerate(params):
             index = at + shift
             t = p.type

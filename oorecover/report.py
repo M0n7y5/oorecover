@@ -103,6 +103,7 @@ def build_report(bv, result):
         vcalls.append({
             "caller": "%#x" % caller,
             "caller_name": f.name if f is not None else None,
+            "caller_type": str(f.type) if f is not None else None,
             "insn": "%#x" % insn,
             "class": cls_name,
             "exact": exact,

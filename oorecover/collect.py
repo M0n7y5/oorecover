@@ -15,7 +15,7 @@ from binaryninja import MediumLevelILOperation as Op
 from binaryninja.enums import RegisterValueType, SymbolType, TypeClass, VariableSourceType
 
 from .facts import AllocCall, ArgPass, MemberAccess, ThisCall, VirtualCall, VtableInstall
-from .names import mangled, mangled_class
+from .names import mangled, member, member_class, scan_scopes
 
 MAX_PASSES = 64
 MAX_ALLOC = 1 << 24
@@ -49,7 +49,7 @@ class FunctionFacts:
         self.reach = 0            # largest this+K address the function forms
         self.argpasses = []       # ArgPass
         self.entry_this = False   # reads its incoming this (declared or by register)
-        self.member_of = None     # class named by the mangled symbol, if any
+        self.member_of = None     # class the mangled symbol places it in, if any (names.member_class)
         self.sret = False         # returns a struct by value: this follows the hidden buffer
         self.sret_size = 0        # extent of the writes into that buffer
 
@@ -121,7 +121,7 @@ def _returns_indirect(func):
     return loc is not None and loc.location.indirect
 
 
-def _this_keys(func, ssa, sret=False):
+def _this_keys(bv, func, ssa, sret=False):
     """SSA keys of the incoming this-pointer: the parameter named this when
     the function type declares one, else the first parameter when the type
     has one, else the first integer argument register (or the first stack
@@ -134,12 +134,15 @@ def _this_keys(func, ssa, sret=False):
     if sret:
         storage = _storage_after_return_buffer(func)
     else:
+        is_member = member(bv, func)
         named = [i for i, v in enumerate(pvars) if v.name == "this"][:1]
-        if named:
+        if named and (is_member or not mangled(func)):
             storage = _param_storage(func, named[0])
-        elif pvars and not mangled(func):
+        elif pvars and not is_member:
             # A demangled member signature lists explicit parameters only: its
             # first declared parameter is not this and must not be keyed as it.
+            # The this Binary Ninja 6.0 declares on a namespace function is
+            # its first real parameter.
             storage = _param_storage(func, 0)
         if storage is None:
             storage = _arg_storage(func, 0)
@@ -289,7 +292,7 @@ def _callee_param_types(bv, call):
         except Exception:
             params = None
         if params is not None:
-            shift = 1 if mangled(func) and not (params and params[0].name == "this") else 0
+            shift = 1 if member(bv, func) and not (params and params[0].name == "this") else 0
             types = [None] * shift + [p.type for p in params]
     _CALLEE_PARAMS[target] = types
     return types
@@ -403,7 +406,7 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
         aliases[key] = (root, off)
         return True
 
-    for key in _this_keys(func, ssa, sret):
+    for key in _this_keys(bv, func, ssa, sret):
         alias(key, ("this",), 0)
     if sret or _returns_indirect(func):
         facts.sret = True       # re-collected past the buffer, or typed so by an earlier pass
@@ -411,7 +414,7 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
     if pvars and pvars[0].name == "sret":
         facts.sret = True       # marking of releases before the native return location, kept one release
     facts.entry_this = _reads_entry_this(func, ssa)
-    facts.member_of = mangled_class(bv, func)
+    facts.member_of = member_class(bv, func)
     for index, keys in _param_keys(func, ssa, MAX_PARAM_ROOTS).items():
         for key in keys:
             alias(key, ("param", index), 0)
@@ -585,7 +588,7 @@ def collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator, 
     if debug is not None:
         print = debug
         print("[oorecover] debug %#x this keys %s params %s" % (
-            func.start, _this_keys(func, ssa), _param_keys(func, ssa, MAX_PARAM_ROOTS)))
+            func.start, _this_keys(bv, func, ssa), _param_keys(func, ssa, MAX_PARAM_ROOTS)))
         print("[oorecover] debug %#x spill writes %s reads %s address_taken %s" % (
             func.start, spill_writes, {k: sorted(v) for k, v in spill_reads.items()}, address_taken))
         for insn in insns:
@@ -708,18 +711,12 @@ def _typed_param_functions(bv, class_names, log=print):
     return starts
 
 
-def _member_functions(bv, log=print):
+def _member_functions(bv):
     """Functions whose mangled name makes them a class member. Non-virtual
     methods are reached through no vtable yet call virtual methods on this;
     members of classes without any vtable are the only evidence those
     classes exist."""
-    t0 = time.time()
-    starts = set()
-    for func in bv.functions:
-        if mangled(func) and mangled_class(bv, func) is not None:
-            starts.add(func.start)
-    log("[oorecover] %d functions are class members by name (%.1fs)" % (len(starts), time.time() - t0))
-    return starts
+    return {func.start for func in bv.functions if member(bv, func)}
 
 
 def _relevant_functions(bv, tables, is_allocator):
@@ -750,10 +747,11 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
     vtable_addrs = {t.address for t in tables}
     slot_functions = frozenset(fn for t in tables for fn in t.functions)
     class_names = {t.rtti_name for t in tables if t.rtti_name} | set(class_names or ())
+    scan_scopes(bv, class_names, log)
     debug_funcs = _debug_funcs()
     pending = sorted(_relevant_functions(bv, tables, is_allocator) | set(extra)
                      | _typed_param_functions(bv, class_names, log)
-                     | _member_functions(bv, log))
+                     | _member_functions(bv))
     result = {}
     seen = set()
     no_il = 0

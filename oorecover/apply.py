@@ -15,9 +15,10 @@ from binaryninja import (FunctionParameter, QualifiedName, ReturnValue, Structur
 from binaryninja.enums import NamedTypeReferenceClass, SymbolType, TypeClass
 
 from .model import topo_order, base_at
-from .names import demangle, mangled, mangled_class, msvc_static, split_qualified
+from .names import (META_TYPES, demangle, mangled, mangled_class, member, member_class,
+                    msvc_static, split_qualified)
 
-_META_KEY = "oorecover.types"
+_META_KEY = META_TYPES
 _NAMES_KEY = "oorecover.functions"
 
 
@@ -353,7 +354,7 @@ def apply_virtual_calls(bv, vcalls, log=print):
     return refs
 
 
-def _declared_shift(func):
+def _declared_shift(bv, func):
     """Register-numbered argument index minus declared parameter index: 1 for
     a member function whose demangled signature omits the implicit this
     (Binary Ninja 5.3 and earlier; 6.0 declares it)."""
@@ -361,9 +362,42 @@ def _declared_shift(func):
         params = list(func.type.parameters)
     except Exception:
         return 0
-    if mangled(func) and not (params and params[0].name == "this"):
+    if member(bv, func) and not (params and params[0].name == "this"):
         return 1
     return 0
+
+
+def apply_namespace_functions(bv, log=print):
+    """Binary Ninja 6.0 declares this on every Itanium function with a nested
+    scope, namespace functions included, which shifts their real parameters
+    one register to the right. A function whose scope has no class evidence
+    gets exactly the explicit list its mangled name encodes."""
+    repaired = 0
+    for func in bv.functions:
+        if not mangled(func) or not func.symbol.raw_name.startswith("_Z") or member(bv, func):
+            continue
+        try:
+            ftype = func.type
+            params = list(ftype.parameters)
+            if not (params and params[0].name == "this"):
+                continue
+            demangled = demangle(bv, func.symbol.raw_name)
+            if demangled is None or demangled[0] is None \
+                    or demangled[0].type_class != TypeClass.FunctionTypeClass:
+                continue
+            explicit = list(demangled[0].parameters)
+            if explicit and explicit[0].name == "this":
+                explicit = explicit[1:]
+            func.set_user_type(Type.function(
+                _return_value(ftype), _default_locations(explicit),
+                calling_convention=ftype.calling_convention,
+                variable_arguments=ftype.has_variable_arguments))
+            repaired += 1
+        except Exception as e:
+            log("[oorecover] namespace function %#x failed: %s" % (func.start, e))
+    if repaired:
+        log("[oorecover] removed the bogus this from %d namespace function signatures" % repaired)
+    return repaired
 
 
 def apply_member_this(bv, facts, class_names, claimed, log=print):
@@ -383,7 +417,7 @@ def apply_member_this(bv, facts, class_names, claimed, log=print):
             params = list(ftype.parameters)
             if params and params[0].name == "this":
                 continue
-            cls_name = mangled_class(bv, func)
+            cls_name = member_class(bv, func)
             if cls_name not in class_names:
                 continue
             func.set_user_type(Type.function(
@@ -446,7 +480,7 @@ def apply_param_types(bv, param_classes, claimed, class_names, log=print):
         try:
             ftype = func.type
             params = list(ftype.parameters)
-            shift = _declared_shift(func)
+            shift = _declared_shift(bv, func)
             changed = False
             for index, name in sorted(entries):
                 if index == 0 and shift == 1:
@@ -722,6 +756,7 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
         # names only one of them, so it gets no this from that name either.
         claimed = {fn for cls in order for fn in cls.owns()} | {fn for cls in order for fn in cls.thunks} \
             | {fn for cls in order for fn in cls.shared} | set(unowned)
+        namespaces = apply_namespace_functions(bv, log)
         if facts:
             newly_typed += apply_member_this(bv, facts, set(by_name), claimed, log)
         apply_unowned(bv, unowned, log)
@@ -744,4 +779,4 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
     log("[oorecover] applied %d class types (%d failures, %d functions gained a this parameter, "
         "%d signatures repaired from mangled names, %d mismatches kept); apply %.1fs, reanalysis %.1fs"
         % (len(defined), failures, newly_typed, repaired, kept, t_apply - t_start, t_reanalysis - t_apply))
-    return newly_typed
+    return newly_typed + namespaces
