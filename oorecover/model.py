@@ -688,7 +688,7 @@ def build_model(bv, mem, tables, facts, log=print):
                 insn, caller, cls_name, " (exact)" if exact else "",
                 ", ".join("%#x" % t for t in targets)))
 
-    result_types, sret_hints, findings_rt = resolve_result_types(bv, classes, facts, claimed, vcalls, log)
+    result_types, findings_rt = resolve_result_types(bv, classes, facts, claimed, vcalls, log)
     findings += findings_rt
 
     classes.sort(key=lambda c: c.name)
@@ -700,7 +700,7 @@ def build_model(bv, mem, tables, facts, log=print):
     return classes, vcalls, param_classes, {
         "findings": findings, "unowned": unowned,
         "instances": {addr: c.name for addr, c in instances.items()},
-        "result_types": result_types, "sret_hints": sret_hints}
+        "result_types": result_types}
 
 
 def _struct_name(t):
@@ -717,16 +717,16 @@ def resolve_result_types(bv, classes, facts, claimed, vcalls, log=print):
     """{function: class name} for methods returning a struct by value whose
     hidden buffer names its type beyond doubt, else the applier keeps a
     placeholder sized from the writes. The buffer handed as this to a
-    constructor or a this-reading member of another class C at least as
-    large as the writes is a C (rule 1); the buffer forwarded as the hidden
-    return of a callee whose result is known is that result (rule 2, to a
-    fixed point, through direct calls and resolved virtual calls). Every
-    implementation of one virtual slot returns the same type, so a resolved
-    type covers its slot across the hierarchy; a slot resolved to two types
-    is reported and left alone. Also returns the functions of a slot whose
-    other implementations return a struct by value but that showed neither
-    a buffer write nor a constructor call themselves (a pure forward): the
-    next pass collects them with the buffer keyed as such."""
+    constructor (by symbol) of another class C at least as large as the
+    writes is a C (rule 1); a member call taking the buffer is not enough,
+    the callee may be a base member or a helper with an out pointer, so it
+    is only counted. The buffer forwarded as the hidden return of a callee
+    whose result is known is that result (rule 2, to a fixed point, through
+    direct calls and resolved virtual calls). Every implementation of one
+    virtual slot returns the same type, so a resolved type covers its slot
+    across the hierarchy, except functions whose own facts speak against a
+    struct return; a slot resolved to two types is reported and left alone.
+    Only a method's own facts make it a struct return."""
     try:
         own = bv.query_metadata(META_TYPES)
     except Exception:
@@ -785,6 +785,7 @@ def resolve_result_types(bv, classes, facts, claimed, vcalls, log=print):
     source = {}     # function -> "call" (rule 1), "forward" (rule 2) or "slot"
     findings = []
     candidates = 0
+    member_calls = 0
     for _ in range(64):
         changed = False
         for fn, ff in facts.items():
@@ -813,8 +814,11 @@ def resolve_result_types(bv, classes, facts, claimed, vcalls, log=print):
                         break
                     continue
                 theirs = member_class(bv, cfunc)
-                reads = symbol_role(bv, ap.callee) == "ctor" or (cf is not None and cf.entry_this)
-                if theirs is None or theirs == mine or not reads:
+                if theirs is None or theirs == mine:
+                    continue
+                if symbol_role(bv, ap.callee) != "ctor":
+                    if cf is not None and cf.entry_this:
+                        member_calls += 1
                     continue
                 size = defined_size(theirs)
                 if size is None:
@@ -843,7 +847,9 @@ def resolve_result_types(bv, classes, facts, claimed, vcalls, log=print):
             if len(names) == 1:
                 name = names.pop()
                 for f in fns:
-                    if f not in out:
+                    # Only a function whose own facts show the hidden buffer
+                    # takes the group's type; the type never makes one sret.
+                    if f not in out and f in facts and facts[f].sret:
                         out[f] = name
                         source[f] = "slot"
                         changed = True
@@ -856,27 +862,13 @@ def resolve_result_types(bv, classes, facts, claimed, vcalls, log=print):
                              ", ".join("%#x" % f for f in sorted(fns))))
             for f in fns:
                 out.pop(f, None)
-    hints = set()
-    for root, fns in groups.items():
-        if any(f in facts and facts[f].sret for f in fns):
-            hints.update(f for f in fns if f in facts and not facts[f].sret)
-    # A slot function that hands its own this as the hidden buffer of a
-    # struct-returning virtual call on another object returns that struct.
-    for fn, ff in facts.items():
-        if ff.sret or fn not in group_of:
-            continue
-        for vc in ff.vcalls:
-            targets = by_site.get((fn, vc.insn), ())
-            if (vc.arg0 == (("this",), 0) and vc.root != ("this",) and targets
-                    and all(t in facts and facts[t].sret for t in targets)):
-                hints.add(fn)
-                break
-    if out or hints:
+    if out or candidates or member_calls:
         counts = [sum(1 for f in out if source.get(f) == how) for how in ("call", "forward", "slot")]
-        log("[oorecover] result types: %d methods returning a struct by value typed (%d by constructor or "
-            "member call, %d forwarded, %d by slot group), %d candidates undefined, %d slot mates to "
-            "re-collect as struct returns" % (len(out), counts[0], counts[1], counts[2], candidates, len(hints)))
-    return out, hints, findings
+        log("[oorecover] result types: %d methods returning a struct by value typed (%d by constructor, "
+            "%d forwarded, %d by slot group), %d constructors of undefined classes, %d buffers handed to "
+            "a member call, not taken as evidence"
+            % (len(out), counts[0], counts[1], counts[2], candidates, member_calls))
+    return out, findings
 
 
 MAX_PLAIN_MEMBER_GAP = 1 << 16

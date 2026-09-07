@@ -914,7 +914,7 @@ _SEEN = set()   # functions the previous collect_all visited, facts or not
 
 
 def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, extra=(),
-                class_names=(), reuse=None, changed=(), changed_types=(), sret_hints=()):
+                class_names=(), reuse=None, changed=(), changed_types=()):
     """Facts per function. With reuse (the previous pass's facts) only the
     functions whose facts can differ are collected again: those retyped
     (changed), those taking a pointer to a class type defined or redefined
@@ -922,8 +922,7 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
     stores read), those whose scope gained or lost class evidence, the
     callers of all of these (call sites carry arguments only once the callee
     is typed), the construction sites in extra (the definitions retype their
-    objects) and functions not visited before; the rest keep their facts.
-    sret_hints are collected with the hidden return buffer keyed as such."""
+    objects) and functions not visited before; the rest keep their facts."""
     global _SEEN
     _CALLEE_PARAMS.clear()
     _CALLEE_BUFFER.clear()
@@ -948,7 +947,7 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
         callers = _callers(bv, retyped | flipped) & relevant
         t_callers = time.time() - t0
         new = relevant - _SEEN
-        todo = retyped | flipped | callers | ((set(extra) | set(sret_hints)) & relevant) | new
+        todo = retyped | flipped | callers | (set(extra) & relevant) | new
         pending = sorted(todo)
         result = {addr: f for addr, f in reuse.items() if addr not in todo}
         log("[oorecover] re-collecting %d of %d relevant functions (%d retyped or taking a redefined "
@@ -976,8 +975,7 @@ def collect_all(bv, mem, abi, tables, log=print, progress=None, cancelled=None, 
             continue
         try:
             f = collect_function(bv, mem, func, vtable_addrs, is_allocator, is_deallocator,
-                                 log if func.start in debug_funcs else None, slot_functions,
-                                 sret=addr in sret_hints)
+                                 log if func.start in debug_funcs else None, slot_functions)
         except Exception:
             failed += 1
             if failed <= 5:

@@ -754,8 +754,8 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                         own_functions.add(fn)
                     ftype = func.type
                     params = list(ftype.parameters)
-                    result = result_types.get(fn)
-                    sret = result is not None or (bool(facts) and fn in facts and facts[fn].sret)
+                    sret = bool(facts) and fn in facts and facts[fn].sret
+                    result = result_types.get(fn) if sret else None
                     if params and params[0].name == "sret":
                         params = params[1:]     # marking of releases before the native return location
                     has_this = bool(params) and params[0].name == "this"

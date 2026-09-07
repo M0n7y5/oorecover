@@ -19,8 +19,7 @@ from .scan import scan_vtables
 
 class Result:
     __slots__ = ("abi", "tables", "facts", "classes", "functions_added", "vcalls", "native",
-                 "param_classes", "earlier_vcalls", "findings", "unowned", "instances", "result_types",
-                 "sret_hints")
+                 "param_classes", "earlier_vcalls", "findings", "unowned", "instances", "result_types")
 
     def __init__(self, abi, tables, facts, classes, functions_added, vcalls=(), native=None,
                  param_classes=None, notes=None):
@@ -38,7 +37,6 @@ class Result:
         self.unowned = dict(notes.get("unowned", {}))     # shared implementation -> its unrelated classes
         self.instances = dict(notes.get("instances", {}))  # static object address -> class name
         self.result_types = dict(notes.get("result_types", {}))  # method -> class of the struct it returns
-        self.sret_hints = set(notes.get("sret_hints", ()))   # slot mates of struct returns, collected as such next
 
 
 def trace_functions(bv, starts, log=print, callers=False):
@@ -81,7 +79,7 @@ def trace_functions(bv, starts, log=print, callers=False):
 
 
 def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_names=(),
-        reuse=None, changed=(), changed_types=(), sret_hints=()):
+        reuse=None, changed=(), changed_types=()):
     cancelled = cancelled or (lambda: False)
     if progress:
         progress("waiting for analysis")
@@ -105,7 +103,7 @@ def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_
         mem = Memory(bv)
     t2 = time.time()
     facts = collect_all(bv, mem, abi, tables, log, progress, cancelled, extra_functions,
-                        class_names, reuse, changed, changed_types, sret_hints)
+                        class_names, reuse, changed, changed_types)
     if cancelled():
         return None
     t3 = time.time()
@@ -157,10 +155,8 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
     reuse = None
     retyped = set()
     retyped_types = set()
-    sret_hints = set()
     for n in range(2):
-        result = run(bv, log, progress, cancelled, extra, class_names, reuse, retyped, retyped_types,
-                     sret_hints)
+        result = run(bv, log, progress, cancelled, extra, class_names, reuse, retyped, retyped_types)
         if result is None:
             log("[oorecover] cancelled")
             return None
@@ -189,8 +185,7 @@ def run_and_apply(bv, log=print, progress=None, cancelled=None):
         for (faddr, _index) in result.param_classes:
             if faddr not in result.facts:
                 extra.add(faddr)
-        sret_hints |= result.sret_hints
-        if newly_typed == 0 and len(extra) == before and not result.sret_hints:
+        if newly_typed == 0 and len(extra) == before:
             break
         if n == 1:
             log("[oorecover] pass 2 done; %d functions discovered late, not visited" % (len(extra) - before))
