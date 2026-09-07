@@ -1,15 +1,129 @@
 # OORecover
 
-C++ class recovery for Binary Ninja: vtables, RTTI, members, inheritance, typed vtables and this parameters, from MLIL SSA analysis. See plugin.json for the full description and tests/ for the fixture matrix.
+OORecover recovers C++ classes from a binary inside Binary Ninja. It finds vtables (symbols, Itanium and MSVC RTTI, pointer scans) and collects this-pointer facts from MLIL SSA: vtable installs, member accesses, constructor chains, allocations, argument passing. It writes the result back into the database: a struct per class with embedded bases and observed members, a VTable struct per table with typed slots, function names, signatures with a typed `this`, cross-references from virtual call sites to their implementations, and types on static instances. It records only what the binary proves. There is no guessing phase: every conclusion rests on a vtable store, a mangled name, a member access or an allocation, and contradictions are withdrawn before anything is applied. It runs on the analysed database, so what Binary Ninja already knows (its RTTI vtable types, user types, symbols) is kept and extended.
+
+## Before and after
+
+The fixture `tests/testprog.cpp` defines these two classes in `namespace zoo` (trimmed):
+
+```cpp
+class Animal {
+public:
+    Animal() { age = 0; tag = 1; }
+    virtual ~Animal() { tag = -1; }
+    virtual int speak() { return age; }
+    virtual int legs() { return 4; }
+    int rate(int k);
+    int age;
+    long tag;
+};
+
+class Dog : public Animal {
+public:
+    int speak() override { return age + tricks; }
+    virtual void bark() { tricks++; }
+    int tricks;
+};
+```
+
+`tests/testprog_stripped` is that program built with `g++ -O1 -fno-inline -s`: RTTI present, no symbols. Binary Ninja's own RTTI pass already names the tables (`_vtable_for_zoo::Animal` at `0x404c28`, typed `struct zoo::Animal::VTable`; `_vtable_for_zoo::Dog{for `zoo::Animal'}` at `0x4047b0`) but there is no `zoo::Animal` struct, no member, and every method is a `sub_` with auto-typed parameters. After the run (`tests/reports/testprog_stripped.json`), the tables keep their names and the rest is filled in:
+
+```c
+struct zoo::Animal {                    // width 24
+    struct zoo::Animal::VTable* _vftable;  // 0
+    uint32_t m_8;                          // 8   (age)
+    uint64_t m_10;                         // 16  (tag)
+};
+struct zoo::Dog {                       // width 32
+    struct zoo::Animal _base_Animal;       // 0
+    uint32_t m_18;                         // 24  (tricks)
+};
+struct zoo::Animal::VTable {            // width 72, slots 0..8
+    int64_t (*vfunc_0)(struct zoo::Animal* this);   // 0
+    int64_t (*dtor)(struct zoo::Animal* this);      // 8
+    uint64_t (*vfunc_2)(struct zoo::Animal* this);  // 16  (speak)
+    struct zoo::Animal::vfunc_5_result (*vfunc_5)(struct zoo::Animal* this);  // 40  (info, returned by hidden pointer)
+    ...
+};
+```
+
+| address | before (stripped) | after | symbol in `tests/testprog` |
+|---|---|---|---|
+| 0x402982 | `sub_402982` | `zoo::Animal::ctor`, `int64_t(struct zoo::Animal* this)` | `_ZN3zoo6AnimalC1Ev` |
+| 0x402924 | `sub_402924` | `zoo::Animal::dtor`, `int64_t(struct zoo::Animal* this)` | `_ZN3zoo6AnimalD0Ev` |
+| 0x402766 | `sub_402766` | `zoo::Animal::vfunc_2`, `uint64_t(struct zoo::Animal* this)` | `_ZN3zoo6Animal5speakEv` |
+| 0x40279c | `sub_40279c` | `zoo::Animal::vfunc_5`, `struct zoo::Animal::vfunc_5_result(struct zoo::Animal* this @ rsi)`, return location `*rdi -> *rax` | `_ZN3zoo6Animal4infoEv` |
+| 0x4021dc | `sub_4021dc` | `zoo::Animal::method_4021dc`, `uint64_t(struct zoo::Animal* this, int32_t arg2)` | `_ZN3zoo6Animal4rateEi` |
+| 0x40280a | `sub_40280a` | `zoo::Dog::vfunc_2`, `uint64_t(struct zoo::Dog* this)` | `_ZN3zoo3Dog5speakEv` |
+
+`rate` has no vtable slot; it is named `method_4021dc` because every caller passes an `Animal` built at the call site and the body reads a member past the vtable pointer. The free function `zoo::feed(Animal* a, int n)` at `0x4022c7` stays `sub_4022c7` (nothing names it) but gets the signature `uint64_t(struct zoo::Animal* arg1, int32_t arg2)` from the objects its callers pass, and its two virtual calls are resolved and cross-referenced:
+
+```
+0x4022d5  zoo::Animal slot 2  -> zoo::Animal::vfunc_2, zoo::Cat::thunk_10_2, zoo::Bat::vfunc_2, zoo::Dog::vfunc_2
+0x4022e1  zoo::Animal slot 3  -> zoo::Animal::vfunc_3
+```
+
+## Usage
+
+- Install: clone into `~/.binaryninja/plugins/oorecover` and restart Binary Ninja (Python 3 plugin, `minimumsupportedversion` 4300 in `plugin.json`). Run `Plugins > OORecover > Recover C++ Classes` (PluginCommand `OORecover\Recover C++ Classes`); it is a cancellable background task with progress text `OORecover: ...`.
+- Two passes. Pass 1 recovers and applies; functions whose signatures hid `this` now carry it, so call sites carry arguments. Pass 2 re-collects only the changed functions and their callers and reuses the other facts. Log lines (`oorecover` logger) to look for: `model: N classes, ...`, `applied N class types (...)`, `pass 2 done`, and finally `oorecover: N classes (itanium ABI)`.
+- Time: the fixture binaries take seconds. On a 3 GB database with about 6900 classes the two passes take about 19 minutes, most of it Binary Ninja producing MLIL. A database typed by an earlier run reuses its facts and skips types and signatures that are already identical (`N types unchanged`, `N left as they were`). Each run is one undo action.
+- What is written: struct types per class, `<Class>::VTable` struct types (secondary tables get `VTable_<offset>`, construction vtables `<Derived>::VTable_ctor_<Base>`), vtable data variables and symbols where Binary Ninja had none, function symbols for auto-named methods (`ctor`, `dtor`, `vfunc_N`, `thunk_<offset>_<slot>`, `method_<addr>`), user function types with `this`, user code references from virtual call sites, types on static instances, and two metadata keys: `oorecover.types` (types a run defined) and `oorecover.functions` (functions it named). Kept: existing user types not created by a previous run (logged `<name>: type exists, kept`), Binary Ninja's RTTI vtable types (updated in place under their names) and its symbols.
+
+## What it recovers
+
+- Vtables and RTTI: Itanium (`_ZTV`, `_ZTI`, VTT) and MSVC (`??_7`, `??_R`, complete object locators), with or without RTTI, with or without symbols; pointer-run scan for tables no symbol or header names.
+- Classes and inheritance: bases at their offsets from RTTI or from the vtable group, virtual bases, embedded objects built by the constructor, construction vtables (by `_ZTT` symbol or VTT shape) typed and attributed to the class under construction.
+- Members and sizes: this-relative reads and writes in owned functions, object sizes from allocations and stack objects at construction sites, base tail padding reused as the Itanium layout does.
+- Constructors and destructors: functions that store vtables through their own `this`; the derived-most table stored last marks a constructor, first a destructor; the other stores at the same offset name the bases.
+- Classes without a vtable, from their mangled member functions (members, constructors, embedded bases); class names without RTTI, from the vtable symbol or from the constructor and destructor symbols that store each table.
+- Virtual call resolution: calls through a vtable slot, including tail dispatch (`jmp [rax+slot]`), speculative devirtualisation guards, and calls through parameters of free functions and non-virtual members; resolved sites get user cross-references to every implementation, and pointer parameters get the class every caller passes.
+- `this` typing: a `struct <Class>* this` on every owned function; detected by name, never by position, so 5.3 databases (explicit parameters only) and 6.0 databases (implicit `this` declared from the mangled name) are both handled.
+- Struct returns through the hidden pointer: a native indirect return location with `this` in the following register and a `<Class>::<method>_result` placeholder sized from the writes, replaced by the real class when a constructor or a known callee names it.
+- Namespace vs class: a scope is a class only with evidence (a vtable or recovered class, a structor or cv-qualified member, a signature mentioning it, a pre-existing struct type); otherwise its functions are namespace functions and a bogus leading `this` is removed.
+- Non-virtual method naming on stripped binaries: `method_<addr>` under the class every caller passes an exact object of, when the body reads or writes a member of it.
+- Consistency checks (OOAnalyzer's insanity rules): members past the object, a function claimed by unrelated classes (linker folding), inheritance cycles, structor roles that cannot all be true; the weaker conclusion is withdrawn, logged and reported under `findings`.
+
+## Evidence rules
+
+- A class exists when a vtable is installed through a `this` pointer, a mangled member name names it, or RTTI describes it. A pointer scan candidate that is never installed is dropped.
+- A function is a member when it stores that class's vtable through its own `this`, sits in the class's primary table, carries a mangled member name, or (non-virtual, unnamed) is called with an exact object of the class by every caller and touches a member of it. A declared type alone is no evidence, and reads under a speculative devirtualisation guard belong to the inlined callee.
+- A struct return is claimed only from a method's own facts: writes through a buffer in the first argument register with `this` in the next, a `this` handed to another class's constructor, or a namespace function reading one register more than its mangled name lists. The type of a slot's other implementations never makes a method a struct return, and unnamed functions with an auto signature are left alone.
+- A placeholder result type is replaced only when the buffer is handed as `this` to a constructor known by symbol of a class at least as large as the writes, or forwarded as the hidden return of a callee whose result is known. A class of matching width is not a match; a buffer handed to an ordinary member call is only counted, since the callee may be a base member or a helper with an out pointer.
+
+## Supported targets and limitations
+
+- Targets: x86-64 and i386, SysV and MSVC calling conventions, Itanium and MSVC ABIs, ELF and PE. The fixtures are built with g++ and clang-cl.
+- Classes with virtual bases report one size covering the virtual-base tail.
+- Secondary tables of virtual bases inherited through an intermediate class are left unattributed (logged `table ... has no base there; ignored`).
+- Static Itanium members keep the `this` Binary Ninja 6.0 declares for them.
+- A class known only through unrelated non-const members has no class evidence and is treated as a namespace.
+- A method whose only buffer write is a copy of a member keeps its `_result` placeholder.
+- Call sites with more than 32 candidate targets get a cross-reference to the static class's own slot only (`N sites capped`).
+- Functions discovered during pass 2 are not visited (`pass 2 done; N functions discovered late, not visited`).
+
+## Development
+
+| fixture (`tests/build.sh` builds them from `tests/testprog.cpp`; missing toolchains skip theirs) | covers |
+|---|---|
+| `testprog` | g++ -O1, RTTI and symbols: names from mangled symbols, `zoo::feed` typed from its name |
+| `testprog_stripped` | same build stripped: names from RTTI only, `sub_` methods, `method_<addr>` naming |
+| `testprog_nortti` | no RTTI, stripped: tables from installs and pointer scan, classes named `class_<vtable address>` |
+| `testprog_o2` | -O2, no RTTI, stripped: inlining, speculative devirtualisation, tail dispatch |
+| `testprog_nortti_sym` | no RTTI with symbols: class names from vtable symbols |
+| `testprog_nortti_novt` | no RTTI, vtable symbols stripped: class names from constructor and destructor symbols |
+| `testprog32` | i386 SysV, stripped: 4-byte pointers, stack arguments |
+| `testprog_icf` | -O2 with lld `--icf=all`: identical functions of unrelated classes folded into one |
+| `testprog_msvc64.exe` | clang-cl x64 with RTTI: MSVC vftables, complete object locators |
+| `testprog_msvc32.exe` | clang-cl x86 with RTTI: 32-bit MSVC layout, absolute-pointer object locators |
+| `testprog_msvc64_nortti.exe` | clang-cl x64 without RTTI or symbols: vftables back to back |
+
+In-GUI runs: with Binary Ninja open, write the fixture paths one per line to `tests/autotest.txt`; the watcher thread started by `__init__.py` picks the file up within two seconds, hot-reloads the pipeline, runs each binary and writes `tests/reports/<fixture>.json`, `tests/reports/autotest.log` and `tests/reports/autotest.done`. A `#keep` line keeps the views open and `#trace 0xADDR` lines trace the collector on those functions instead of running the pipeline. `python3 tests/check_reports.py [fixture ...]` then asserts on the reports (default: every report present).
+
+Offline tests, each runnable with plain `python3`: `tests/check_names.py` (undefined-name scan of the sources, which hot reload hides; no Binary Ninja needed), `tests/test_validate.py` (consistency rules on synthetic models) and `tests/test_demangle.py` (typeinfo and MSVC type name demangling). The last two import the plugin package, which imports `binaryninja`, so put the Binary Ninja Python API on `PYTHONPATH`.
+
+Directives: `tests/trace.txt` with `0xADDR` words (plus `after-apply` to trace after a first recover-and-apply, `callers` to include callers) makes the next run trace those functions instead of recovering; `tests/reanalyze.txt` makes it discard the saved analysis and reanalyse the whole binary first, to measure what a core upgrade changes. Both files are gitignored.
 
 ## Binary Ninja 6.0 notes
 
-Implicit this. Binary Ninja 6.0 declares the implicit this parameter when it types an Itanium member function from its demangled symbol, and it does so for static Itanium members too, which never read one. Thunk symbols are the exception: their demangled types list only the explicit parameters. Databases saved by 5.3 keep the old explicit-only signatures. The plugin therefore never assumes a position: it detects this by the parameter name and inserts one only when no parameter named this exists (names.mangled, collect._this_keys, apply.apply_member_this).
-
-Namespace functions. 6.0 declares that this for every Itanium name with a nested scope, so a namespace function such as zoo::feed(zoo::Animal*, int) reads (struct zoo* this, zoo::Animal*, int) and every real parameter sits one register too far right; 5.3 databases keep the explicit list, but the collector then took the first argument register for this and grouped such functions into a plain class named after the namespace. The name alone cannot tell a namespace from a class, so names.scan_scopes decides per scope from evidence: a vtable or recovered class of that name, a constructor, destructor or cv-qualified member symbol, a demangled signature that mentions the scope as a parameter or return type, or a structure type in the view that no run of ours created. A scope with none of that is a namespace: names.member_class returns None for its functions, the collector keys them like unmangled functions (first parameter, no member_of), and apply.apply_namespace_functions replaces a leading this with the demangled explicit list. A class known only through unrelated non-const members has no such evidence and is treated as a namespace; a static member of a class with evidence keeps the this 6.0 gives it. MSVC names are unaffected; the mangling encodes membership.
-
-Tail dispatch. A method whose body is `mov rax, [rdi]; jmp [rax+slot]` reaches MLIL as MLIL_JUMP through the slot load while this carries a struct type (6.0 types it from the mangled name), and only later, once the slot is typed, as a tail call; the collector therefore treats a jump whose target is a vtable slot load like a call site (collect._VCALL_SITES). Speculative devirtualisation (`cmp rax, expected; jne`) reloads the vtable on the indirect branch and merges it with the first load in a phi, which the vtable and slot pointer propagation follows.
-
-Struct returns by hidden pointer. A method returning a structure by value is expressed natively with ReturnValue(struct, ValueLocation([ValueLocationComponent(buf)], indirect=True, returned_pointer=echo)), where buf is cc.get_indirect_return_value_location() and echo is cc.get_returned_indirect_return_value_pointer(). Binary Ninja then lays this out in the following argument register (rsi on SysV x86-64, rdx on MSVC x64, the next stack slot on i386), reports it first in parameter_vars and parameter_locations, and shows the buffer as the return value in HLIL (struct result; return result). The return location prints as *rdi -> *rax. When Binary Ninja's return type is not already a structure the plugin defines a placeholder named <Class>::<method>_result whose width spans the writes observed into the buffer, and records it among its own types. The default return location is not enough: with a type whose width Binary Ninja cannot see or that fits in registers the calling convention keeps this in the first register, so the location is always given explicitly. The placeholder gives way to a real class when the buffer's use names one beyond doubt (model.resolve_result_types): the buffer handed as this to a constructor (by symbol) of another class at least as large as the writes, or forwarded as the hidden return of a callee whose result is known (direct or resolved virtual, to a fixed point), and every implementation of one virtual slot that returns a struct by itself shares the result. A buffer handed to an ordinary member call is only counted: the callee may be a base member or a helper with an out pointer. Only a method's own facts make it a struct return; the type of its slot mates never does, one misjudged override would otherwise poison the whole slot. A method whose only buffer write is a copy of a member keeps its placeholder; matching such copies against a struct-typed source member would be further evidence, once something types members as structs. A virtual method that hands its this to another class's constructor is also recognised as returning a struct by value (collect._foreign_ctor), and so is a namespace function that reads one argument register more than its mangled name lists, writes through the first and returns it (collect._returns_first_register): its buffer is the native indirect return, the explicit parameters follow it, and both the collector and the parameter inference count its arguments from register 1 (collect._free_struct_return). Unnamed functions are left alone, an auto signature declares too little to tell the shape from a destructor returning this. Any signature rebuilt from a function type must pass ReturnValue(ftype.return_value, ftype.return_value_location) (apply._return_value), because Type.function with the bare return type resets the location to the default. Once a function carries a custom return location Binary Ninja renders the resolved parameter locations in its type string (this @ rsi). In 6.0.10601 ParameterLocations.__len__ is broken (it reads a _vars attribute that does not exist), so list(func.parameter_locations) raises; read func.parameter_locations.locations instead.
-
-Demangler configuration. Demangling tens of thousands of names with a per-name configuration is far too slow, so names.demangler_config keeps one DemanglerConfig(None, bv, simplify) per view, where simplify follows the view's analysis.types.templateSimplifier setting so class names are spelled the way Binary Ninja spells its own symbols and types. The cache is keyed on the view object and rebuilt when another view is analysed.
+6.0 declares an implicit `this` on every Itanium name with a nested scope when it types a function from its demangled symbol, namespace functions such as `zoo::feed(zoo::Animal*, int)` and static members included; thunk symbols and 5.3 databases keep the explicit list. The plugin therefore finds `this` by name, never by position. Struct returns use the native indirect return location (`ReturnValue` with `ValueLocation(..., indirect=True, returned_pointer=...)`), which Binary Ninja lays out in the following argument register (`rsi` on SysV x86-64, `rdx` on MSVC x64, the next stack slot on i386) and prints as `this @ rsi` and `*rdi -> *rax`. Demangling uses one `DemanglerConfig` per view whose `simplify` follows `analysis.types.templateSimplifier`, so class names are spelled the way Binary Ninja spells its own symbols and types.
