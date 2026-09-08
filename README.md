@@ -30,7 +30,7 @@ public:
 
 `zoo::Animal::Animal()` before:
 ```c
-int64_t sub_402982(struct zoo::Animal::VTable** arg1)
+int64_t sub_402a32(struct zoo::Animal::VTable** arg1)
 {
     *(uint64_t*)arg1 = &_vtable_for_zoo::Animal;
     arg1[1] = 0;
@@ -66,7 +66,7 @@ uint64_t zoo::Animal::method_4021dc(struct zoo::Animal* this, int32_t arg2)
 ```
 `zoo::Dog::speak()` before:
 ```c
-uint64_t sub_40280a(void* arg1)
+uint64_t sub_402868(void* arg1)
 {
     return (uint64_t)(*(uint32_t*)((char*)arg1 + 8) + *(uint32_t*)((char*)arg1 + 0x18));
 }
@@ -77,6 +77,11 @@ uint64_t zoo::Dog::vfunc_2(struct zoo::Dog* this)
 {
     return (uint64_t)(this->_base_Animal.m_8 + this->m_18);
 }
+```
+The destructor pair fills the first two slots of `struct zoo::Animal::VTable`; `dtor_complete` is the non-deleting one:
+```
+slot 0  0x4027c2  zoo::Animal::dtor_complete
+slot 1  0x4029bc  zoo::Animal::dtor
 ```
 
 The struct behind those names, with the source members for reference:
@@ -92,15 +97,15 @@ struct zoo::Animal {                    // width 24
 `rate` has no vtable slot; it is named `method_4021dc` because every caller passes an `Animal` built at the call site and the body reads a member past the vtable pointer. The free function `zoo::feed(Animal* a, int n)` at `0x4022c7` stays `sub_4022c7` (nothing names it) but gets the signature `uint64_t(struct zoo::Animal* arg1, int32_t arg2)` from the objects its callers pass, and its two virtual calls are resolved and cross-referenced:
 
 ```
-0x4022d5  zoo::Animal slot 2  -> zoo::Animal::vfunc_2, zoo::Cat::thunk_10_2, zoo::Bat::vfunc_2, zoo::Dog::vfunc_2
-0x4022e1  zoo::Animal slot 3  -> zoo::Animal::vfunc_3
+0x4022d5  zoo::Animal slot 2  -> zoo::Animal::vfunc_2, zoo::Lion::thunk_10_2, zoo::Cat::thunk_10_2, zoo::Bat::vfunc_2, zoo::Dog::vfunc_2
+0x4022e1  zoo::Animal slot 3  -> zoo::Animal::vfunc_3, zoo::Lion::thunk_10_3
 ```
 
 ## Usage
 
 - Install: clone into `~/.binaryninja/plugins/oorecover` and restart Binary Ninja (Python 3 plugin, `minimumsupportedversion` 4300 in `plugin.json`). Run `Plugins > OORecover > Recover C++ Classes` (PluginCommand `OORecover\Recover C++ Classes`); it is a cancellable background task with progress text `OORecover: ...`.
 - Two passes. Pass 1 recovers and applies; functions whose signatures hid `this` now carry it, so call sites carry arguments. Pass 2 re-collects only the changed functions and their callers and reuses the other facts. Log lines (`oorecover` logger) to look for: `model: N classes, ...`, `applied N class types (...)`, `pass 2 done`, and finally `oorecover: N classes (itanium ABI)`.
-- Time: the fixture binaries take seconds. On a 3 GB database with about 6900 classes the two passes take about 14 minutes, most of it Binary Ninja producing MLIL. A database typed by an earlier run reuses its facts and skips types and signatures that are already identical (`N types unchanged`, `N left as they were`). Each run is one undo action.
+- Time: the fixture binaries take seconds. On a 3 GB database with about 6900 classes the two passes take about 15 minutes, most of it Binary Ninja producing MLIL. A database typed by an earlier run reuses its facts and skips types and signatures that are already identical (`N types unchanged`, `N left as they were`). Each run is one undo action.
 - What is written: struct types per class, `<Class>::VTable` struct types (secondary tables get `VTable_<offset>`, construction vtables `<Derived>::VTable_ctor_<Base>`), vtable data variables and symbols where Binary Ninja had none, function symbols for auto-named methods (`ctor`, `dtor`, `dtor_complete` for the Itanium complete destructor in the slot before the deleting `dtor`, `vfunc_N`, `thunk_<offset>_<slot>`, `method_<addr>`), user function types with `this`, user code references from virtual call sites, types on static instances, and two metadata keys: `oorecover.types` (types a run defined) and `oorecover.functions` (functions it named). Kept: existing user types not created by a previous run (logged `<name>: type exists, kept`), Binary Ninja's RTTI vtable types (updated in place under their names) and its symbols.
 
 ## What it recovers
