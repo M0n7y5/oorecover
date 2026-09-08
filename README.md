@@ -1,3 +1,10 @@
+> [!Warning] 
+> This shit is highly experimental. It can randomly explode and steal your cement. Don't ask me how i know it.
+
+<img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/d894bbc2-33ba-483d-a5f4-a2266da16426" />
+
+
+
 # OORecover
 
 OORecover recovers C++ classes from a binary inside Binary Ninja. It finds vtables (symbols, Itanium and MSVC RTTI, pointer scans) and collects this-pointer facts from MLIL SSA: vtable installs, member accesses, constructor chains, allocations, argument passing. It writes the result back into the database: a struct per class with embedded bases and observed members, a VTable struct per table with typed slots, function names, signatures with a typed `this`, cross-references from virtual call sites to their implementations, and types on static instances. It records only what the binary proves. There is no guessing phase: every conclusion rests on a vtable store, a mangled name, a member access or an allocation, and contradictions are withdrawn before anything is applied. It runs on the analysed database, so what Binary Ninja already knows (its RTTI vtable types, user types, symbols) is kept and extended.
