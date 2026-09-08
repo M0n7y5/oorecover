@@ -198,6 +198,30 @@ public:
     NOINLINE int noise() { return pet->speak(); }
     Animal* pet;
 };
+
+// A base with no vtable of its own: Trunk is abstract (mix stays pure),
+// has no key function and is never constructed on its own. At -O1 g++
+// still emits its vtable for its out-of-line constructor; at -O2 (the icf
+// fixture) the constructor is inlined away and only Trunk's typeinfo
+// remains, while Elephant's vtable group holds the table for its Mixin
+// sub-object at Trunk's Mixin offset, which only Trunk's RTTI explains.
+// clang-cl emits Trunk's vftables in every build.
+class Horn {
+public:
+    Horn() { hlen = 1; }
+    virtual int blow() { return hlen * 3 + 1; }   // unlike Animal::speak, or ICF folds them
+    int hlen;
+};
+class Mixin {
+public:
+    virtual int mix() = 0;
+};
+class Trunk : public Horn, public Mixin {};
+class Elephant : public Trunk {
+public:
+    int mix() override { return hlen + 1; }
+};
+NOINLINE int poke(Mixin* m) { return m->mix(); }
 }
 zoo::Beacon g_beacon;
 
@@ -213,6 +237,8 @@ NOINLINE int labels(zoo::Animal* a, zoo::Animal* b, zoo::Puppy* p) {
 
 int main() {
     int r0 = 0;
+    zoo::Elephant el;
+    el.hlen = 3;
     zoo::Animal an;
     an.age = 11;
     zoo::Wing w;
@@ -251,7 +277,7 @@ int main() {
     zoo::Stats st(r);
     zoo::Counter ct;
     zoo::Kennel kn;
-    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3) + p.play() + p.rest() + use(&p) + ct.bump(4, heap) + kn.noise();
+    r += st.bump(2) + st.bump(3) + zoo::feed(&an, 2) + zoo::feed(heap, 3) + p.play() + p.rest() + use(&p) + ct.bump(4, heap) + kn.noise() + zoo::poke(&el);
     delete heap;
     delete cat;
     return r;

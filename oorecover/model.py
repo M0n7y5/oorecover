@@ -256,7 +256,7 @@ def _has_ref(bv, addr):
     return False
 
 
-def build_model(bv, mem, tables, facts, log=print):
+def build_model(bv, mem, tables, facts, log=print, rtti_bases=None):
     ptrsize = mem.ptrsize
     table_at = {t.address: t for t in tables}
     classes = []
@@ -289,15 +289,41 @@ def build_model(bv, mem, tables, facts, log=print):
             owner[t.address] = cls
         classes.append(cls)
 
-    def sub_offsets(ti, at, out, depth=0):
+    bridged = {}       # typeinfo -> model class made for a base with no table of its own
+
+    def direct_bases(ti):
+        """RTTI bases of the class ti describes: from its table group, else
+        from the parser, which reads the typeinfo of classes whose vtable is
+        not in the binary (shared library, never constructed here)."""
+        bases = bases_by_ti.get(ti)
+        if bases is None and rtti_bases is not None and ti is not None:
+            bases = rtti_bases(ti)
+        return bases or ()
+
+    def sub_offsets(ti, at, out, targets=(), depth=0):
         """Offsets of every non-virtual base sub-object, direct or indirect,
-        of the class ti describes when it sits at `at`."""
+        of the class ti describes when it sits at `at`. Returns whether one
+        of `targets` (the group's table offsets) lies in the subtree. A base
+        with no table group of its own that leads to one becomes a model
+        class without vtables, so the chain from the group's class down to
+        the table's class resolves through it."""
+        hit = False
         if depth > 32:
-            return
-        for b in bases_by_ti.get(ti, ()):
-            if b.offset is not None:
-                out.add(at + b.offset)
-                sub_offsets(b.typeinfo, at + b.offset, out, depth + 1)
+            return hit
+        for b in direct_bases(ti):
+            if b.offset is None:
+                continue
+            here = at + b.offset
+            out.add(here)
+            inner = sub_offsets(b.typeinfo, here, out, targets, depth + 1)
+            if inner and b.typeinfo not in bases_by_ti and b.typeinfo not in bridged and b.name:
+                bc = ClassModel(unique(b.name, b.typeinfo), b.typeinfo)
+                bc.bases = [BaseRef(x.name, x.offset, x.virtual, x.typeinfo)
+                            for x in direct_bases(b.typeinfo)]
+                bridged[b.typeinfo] = bc
+                classes.append(bc)
+            hit = hit or inner or here in targets
+        return hit
 
     def virtual_sub_objects(cls, group, primary, explained):
         """Explain the group's tables at offsets no non-virtual base chain
@@ -323,7 +349,7 @@ def build_model(bv, mem, tables, facts, log=print):
                 cls.bases.append(BaseRef(v.name, off, True, v.typeinfo))
             if off in pending:
                 explained.add(off)
-                sub_offsets(v.typeinfo, off, explained, 1)
+                sub_offsets(v.typeinfo, off, explained, pending, 1)
         return len(pending - explained)
 
     def group_by(key):
@@ -350,7 +376,7 @@ def build_model(bv, mem, tables, facts, log=print):
                                 primary.address), ti)
         cls.bases = [BaseRef(b.name, b.offset, b.virtual, b.typeinfo) for b in primary.bases]
         explained = set()
-        sub_offsets(ti, 0, explained)
+        sub_offsets(ti, 0, explained, {t.object_offset for t in group} - {0})
         ambiguous = virtual_sub_objects(cls, group, primary, explained)
         note = (" (%d virtual bases, %d tables unexplained)" % (len(primary.vbases), ambiguous)
                 if ambiguous else "")
@@ -358,6 +384,9 @@ def build_model(bv, mem, tables, facts, log=print):
         for t in construction:
             if t.typeinfo_addr == ti:
                 cls.construction.setdefault(t.construction, {})[t.object_offset] = t
+    if bridged:
+        log("[oorecover] %d classes without a vtable of their own carry bases with one (from RTTI)"
+            % len(bridged))
 
     for _sym, group, primary in group_by(
             lambda t: t.sym_addr if not t.has_rtti and t.sym_name else None):

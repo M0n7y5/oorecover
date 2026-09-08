@@ -297,17 +297,19 @@ def check_construction(name, rep):
 # code layout), from testprog.json: Animal::rate reads age through its
 # object, Kennel::noise reads pet; Puppy::play and rest only call virtuals,
 # as use() does, so they stay unnamed; Stats and Counter exist only by symbol here.
-NONVIRTUAL = {"testprog_stripped": {"0x4021dc": "zoo::Animal", "0x402bc2": "zoo::Kennel"},
-              "testprog32": {"0x1120e": "zoo::Animal", "0x11d8a": "zoo::Kennel"},
-              "testprog_msvc64.exe": {"0x140001004": "zoo::Animal", "0x140001668": "zoo::Kennel"},
-              "testprog_msvc32.exe": {"0x401004": "zoo::Animal", "0x40153c": "zoo::Kennel"}}
-FREE_FUNCTIONS = {"testprog_stripped": ("0x40226a", "0x402294", "0x4022a3", "0x402321", "0x4022c7", "0x4022ed"),
-                  "testprog32": ("0x112a8", "0x112cb", "0x112dc", "0x1135f", "0x1130a", "0x11330"),
+NONVIRTUAL = {"testprog_stripped": {"0x4021dc": "zoo::Animal", "0x402c0c": "zoo::Kennel"},
+              "testprog32": {"0x1120e": "zoo::Animal", "0x11de0": "zoo::Kennel"},
+              "testprog_msvc64.exe": {"0x140001004": "zoo::Animal", "0x1400016a2": "zoo::Kennel"},
+              "testprog_msvc32.exe": {"0x401004": "zoo::Animal", "0x401580": "zoo::Kennel"}}
+# use, measure, flapit, labels, zoo::feed, zoo::where, zoo::poke.
+FREE_FUNCTIONS = {"testprog_stripped": ("0x40226a", "0x402294", "0x4022a3", "0x40232f", "0x4022c7", "0x4022ed", "0x402321"),
+                  "testprog32": ("0x112a8", "0x112cb", "0x112dc", "0x1136f", "0x1130a", "0x11330", "0x1135f"),
                   # -O2: speculative devirtualisation inlines callee bodies under
                   # type guards, so every function reading members through its
-                  # parameter is guarded, Animal::rate included: nothing is named.
-                  "testprog_o2": ("0x4026e0", "0x402720", "0x402750", "0x402820", "0x402790", "0x4027d0",
-                                  "0x402610", "0x402680")}
+                  # parameter is guarded, Animal::rate and Kennel::noise included:
+                  # nothing is named.
+                  "testprog_o2": ("0x402770", "0x4027b0", "0x4027e0", "0x4028e0", "0x402820", "0x402860",
+                                  "0x4028b0", "0x402660", "0x402630")}
 
 
 def check_nonvirtual(name, rep):
@@ -654,6 +656,44 @@ def check_virtual_base(name, rep):
     assert not stray, (name, stray)
 
 
+# Fixtures where Trunk's vtable is not in the binary: g++ at -O2 inlines
+# its constructor away, lld-link drops clang-cl's unreferenced comdats.
+BRIDGED_FIXTURES = ("testprog_icf", "testprog_msvc64.exe", "testprog_msvc32.exe")
+
+
+def check_trunk(name, rep):
+    """Elephant derives from Trunk (Horn at 0, Mixin past it), whose own
+    vtable may be absent: Elephant's table for the Mixin sub-object is then
+    explained only by Trunk's RTTI. Trunk becomes a class without tables
+    carrying its bases, Elephant keeps Trunk as its base, and the table is
+    Elephant's, typed for the Mixin sub-object."""
+    if name not in RTTI_FIXTURES + FOLDED_FIXTURES:
+        return
+    p = rep["ptrsize"]
+    cmap = {c["name"]: c for c in rep["classes"]}
+    elephant, trunk = cmap["zoo::Elephant"], cmap["zoo::Trunk"]
+    mixin_off = 2 * p    # Horn is a vptr and an int, padded to the pointer size
+    assert elephant["bases"] == [{"name": "zoo::Trunk", "offset": 0, "virtual": False}], (name, elephant["bases"])
+    tb = base_map(trunk)
+    assert tb.get("zoo::Horn", {}).get("offset") == 0 and tb.get("zoo::Mixin", {}).get("offset") == mixin_off, (name, trunk["bases"])
+    assert sorted(int(o) for o in elephant["vtables"]) == [0, mixin_off], (name, elephant["vtables"])
+    typed = elephant["vtbl_types"][str(mixin_off)]
+    assert typed and len(typed["members"]) == len(elephant["vtables"][str(mixin_off)]["slots"]), (name, typed)
+    # Binary Ninja's own name for the table is kept when it has one, so only
+    # the class is fixed: zoo::Mixin::zoo::Elephant::VTable or its spelling.
+    final = rep["final"]["tables"][elephant["vtables"][str(mixin_off)]["address"]]
+    assert final["type"] and "zoo::Elephant::VTable" in final["type"], (name, final)
+    thunks = [fn for fn in elephant["vtables"][str(mixin_off)]["slots"] if fn in elephant["thunks"]]
+    assert thunks and all(elephant["thunks"][fn] == mixin_off for fn in thunks), (name, elephant["thunks"])
+    if name in BRIDGED_FIXTURES:
+        assert not trunk["vtables"] and not trunk["functions"], (name, "Trunk has a vtable after all", trunk["vtables"])
+        assert any("carry bases with one" in line for line in log_section(name)), (name, "no bridged class logged")
+    else:
+        assert sorted(int(o) for o in trunk["vtables"]) == [0, mixin_off], (name, trunk["vtables"])
+    stray = [line for line in log_section(name) if "has no base there" in line]
+    assert not stray, (name, stray)
+
+
 def main(argv):
     names = argv or [n for n in RTTI_FIXTURES + NORTTI_FIXTURES + NAMED_NORTTI_FIXTURES + FOLDED_FIXTURES
                      if os.path.exists(os.path.join(REPORTS, n + ".json"))]
@@ -673,6 +713,7 @@ def main(argv):
             check_struct_returns(name, load(name))
             check_construction(name, load(name))
             check_virtual_base(name, load(name))
+            check_trunk(name, load(name))
             check_nonvirtual(name, load(name))
             check_complete_dtors(name, load(name))
             check_kennel(name, load(name))

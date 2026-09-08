@@ -392,6 +392,12 @@ class Itanium:
             end = _skip_ident(body, 0)
         return demangle_name(self.bv, body[:end])
 
+    def rtti_bases(self, ti):
+        """Direct bases of the class typeinfo ti describes, whether or not
+        its vtable is in the binary; None when ti is not a typeinfo."""
+        parsed = self.parse_typeinfo(ti)
+        return parsed[1] if parsed else None
+
     def read_virtual_bases(self, tables, log=print):
         """Record on each primary table the virtual bases of its class,
         direct or indirect, with the object offsets the header gives: one

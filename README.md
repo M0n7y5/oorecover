@@ -129,7 +129,7 @@ struct zoo::Animal {                    // width 24
 
 - Targets: x86-64 and i386, SysV and MSVC calling conventions, Itanium and MSVC ABIs, ELF and PE. The fixtures are built with g++ and clang-cl.
 - Classes with virtual bases report one size covering the virtual-base tail.
-- A secondary table no base explains, because its class has several virtual bases and the vtable header could not be read (a virtual primary base puts vcall offsets in front of the vbase entries), is left unattributed (logged `table ... has no base there; ignored (N virtual bases, M tables unexplained)`). MSVC vbtables are not read: virtual base offsets there come only from the single-table case.
+- Base chains are followed through RTTI even where a base has no vtable in the binary (defined in a shared library, or its constructor inlined away): such a base becomes a class without tables carrying its own bases, so the derived class's secondary tables resolve through it. A secondary table no base explains, because its class has several virtual bases and the vtable header could not be read (a virtual primary base puts vcall offsets in front of the vbase entries), is left unattributed (logged `table ... has no base there; ignored (N virtual bases, M tables unexplained)`). MSVC vbtables are not read: virtual base offsets there come only from the single-table case.
 - Static Itanium members keep the `this` Binary Ninja 6.0 declares for them.
 - A class known only through unrelated non-const members has no class evidence and is treated as a namespace.
 - A method whose only buffer write is a copy of a member keeps its `_result` placeholder.

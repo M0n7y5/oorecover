@@ -195,6 +195,7 @@ class MSVC:
         self._td_cache = {}
         self._chd_cache = {}
         self._col_cache = {}
+        self._td_chd = {}     # type descriptor -> its class hierarchy descriptor, from a base entry
 
     def _ref(self, addr):
         """Read a pointer-or-RVA field."""
@@ -274,6 +275,11 @@ class MSVC:
                 break
             name = self.parse_td(td)
             virtual = pdisp != -1
+            attributes = self.mem.read_uint(bcd + 20, 4) or 0
+            if attributes & 0x40 and td not in self._td_chd:    # BCD_HASPCHD
+                pchd = self._ref(bcd + 24)
+                if pchd is not None and self.mem.is_data(pchd):
+                    self._td_chd[td] = pchd
             if i == next_direct:
                 bases.append(BaseRef(name, None if virtual else mdisp, virtual, td))
                 next_direct = i + 1 + contained
@@ -282,6 +288,13 @@ class MSVC:
                 vbases.append(BaseRef(name, None, True, td))
         self._chd_cache[chd] = (bases, vbases)
         return bases, vbases
+
+    def rtti_bases(self, td):
+        """Direct bases of the class td describes, from the hierarchy
+        descriptor a base entry of some derived class pointed at, whether
+        or not the class has a vftable of its own; None when unknown."""
+        chd = self._td_chd.get(td)
+        return self.parse_chd(chd)[0] if chd is not None else None
 
     def parse_vtable_at(self, ap, why=None, trusted=False, bound=None):
         p = self.mem.ptrsize

@@ -779,9 +779,11 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                         slot_index.setdefault(fn, i)
 
             def base_ptr_at(off):
-                for b in cls.bases:
-                    if b.offset == off and b.name in defined:
-                        return _named_ptr(bv, b.name)
+                # The base whose sub-object the thunk adjusts to, direct or
+                # through a base chain, as the table's name resolves it.
+                name = base_at(cls, off, by_name)
+                if name in defined:
+                    return _named_ptr(bv, name)
                 return cls_ptr
 
             complete = _complete_dtors(bv, cls, own_functions, facts) if abi == "itanium" else set()

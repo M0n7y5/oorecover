@@ -109,7 +109,8 @@ def run(bv, log=print, progress=None, cancelled=None, extra_functions=(), class_
     if cancelled():
         return None
     t3 = time.time()
-    classes, vcalls, param_classes, notes = build_model(bv, mem, tables, facts, log)
+    classes, vcalls, param_classes, notes = build_model(bv, mem, tables, facts, log,
+                                                        rtti_bases=getattr(abi, "rtti_bases", None))
     native = vtable_snapshot(bv, tables)
     log("[oorecover] native rtti: %d VTable types, %d/%d tables with symbols, %d/%d typed"
         % (len(native["vtable_types"]),
