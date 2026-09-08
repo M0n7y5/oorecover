@@ -246,19 +246,23 @@ class MSVC:
         return offset, td, chd
 
     def parse_chd(self, chd):
-        """Returns the list of direct bases as [BaseRef]."""
+        """Returns (direct bases, virtual bases) as [BaseRef] lists. The base
+        class array lists every base in depth-first order, each followed by
+        the bases it contains; an entry reached through a virtual base
+        carries a vbtable displacement instead of a fixed offset. Virtual
+        base offsets live in the vbtable, not in the RTTI, so they stay None."""
         if chd in self._chd_cache:
             return self._chd_cache[chd]
-        self._chd_cache[chd] = []
+        self._chd_cache[chd] = ([], [])
         sig = self.mem.read_uint(chd, 4)
         count = self.mem.read_uint(chd + 8, 4)
         bca = self._ref(chd + 12)
         if sig != 0 or count is None or not 1 <= count <= MAX_BASES or not self.mem.is_data(bca):
-            return []
+            return [], []
         refsize = 4 if self.mem.ptrsize == 8 else self.mem.ptrsize
-        bases = []
-        i = 1
-        while i < count:
+        bases, vbases, seen = [], [], set()
+        next_direct = 1
+        for i in range(1, count):
             bcd = self._ref(bca + i * refsize)
             if bcd is None or not self.mem.is_data(bcd):
                 break
@@ -270,24 +274,28 @@ class MSVC:
                 break
             name = self.parse_td(td)
             virtual = pdisp != -1
-            bases.append(BaseRef(name, None if virtual else mdisp, virtual, td))
-            i += 1 + contained
-        self._chd_cache[chd] = bases
-        return bases
+            if i == next_direct:
+                bases.append(BaseRef(name, None if virtual else mdisp, virtual, td))
+                next_direct = i + 1 + contained
+            if virtual and td not in seen:
+                seen.add(td)
+                vbases.append(BaseRef(name, None, True, td))
+        self._chd_cache[chd] = (bases, vbases)
+        return bases, vbases
 
     def parse_vtable_at(self, ap, why=None, trusted=False, bound=None):
         p = self.mem.ptrsize
         col = self.mem.read_ptr(ap - p)
         if col is None:
             return _fail(why, "header unreadable")
-        name, bases, td, offset = None, [], None, 0
+        name, bases, vbases, td, offset = None, [], [], None, 0
         parsed = self.parse_col(col) if col else None
         if parsed is not None:
             offset, td, chd = parsed
             name = self.parse_td(td)
             if name is None:
                 return _fail(why, "type descriptor %#x unparsable" % td)
-            bases = self.parse_chd(chd)
+            bases, vbases = self.parse_chd(chd)
         limit = MAX_SLOTS if bound is None else max(0, min(MAX_SLOTS, (bound - ap) // p))
         slots, unresolved = read_slots(self.mem, ap, limit,
                                        allow_null=parsed is not None or trusted,
@@ -297,7 +305,7 @@ class MSVC:
             return _fail(why, "no function slots (%d pure)" % len(slots))
         return VtableInfo(address=ap, slots=slots, typeinfo_addr=td,
                           object_offset=offset, rtti_name=name,
-                          bases=list(bases), unresolved=unresolved)
+                          bases=list(bases), unresolved=unresolved, vbases=list(vbases))
 
     def symbol_candidates(self):
         for sym in self.bv.get_symbols():

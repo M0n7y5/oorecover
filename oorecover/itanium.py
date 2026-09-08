@@ -2,6 +2,9 @@
 
 Reference: https://itanium-cxx-abi.github.io/cxx-abi/abi.html#rtti
 Vtable layout around the address point AP (ptr = pointer size):
+  AP - (3+i)*ptr : vbase offset of the i-th virtual base (classes with
+                   virtual bases only; the primary base's come first, then
+                   the class's own in inheritance graph order, nearest first)
   AP - 2*ptr : offset-to-top (0 for the primary table, negative otherwise)
   AP - ptr   : pointer to the typeinfo object (0 when built with -fno-rtti)
 typeinfo object:
@@ -388,6 +391,83 @@ class Itanium:
         else:
             end = _skip_ident(body, 0)
         return demangle_name(self.bv, body[:end])
+
+    def read_virtual_bases(self, tables, log=print):
+        """Record on each primary table the virtual bases of its class,
+        direct or indirect, with the object offsets the header gives: one
+        vbase offset entry per virtual base precedes offset-to-top, the
+        primary base's entries first, then the class's own in inheritance
+        graph order, nearest first (GCC and Clang agree). A virtual
+        primary base puts vcall offsets in front of them, which RTTI does
+        not reveal, so the entries count only when every polymorphic
+        virtual base lands on a distinct secondary table of the group."""
+        p = self.mem.ptrsize
+        primaries = {}      # typeinfo -> primary table
+        offsets = {}        # typeinfo -> object offsets of the group's tables
+        for t in tables:
+            if not t.has_rtti or t.construction:
+                continue
+            offsets.setdefault(t.typeinfo_addr, set()).add(t.object_offset)
+            if t.object_offset == 0:
+                primaries.setdefault(t.typeinfo_addr, t)
+        with_vbases = trusted = 0
+        for ti, prim in primaries.items():
+            order = self._vbase_order(ti, primaries)
+            if not order:
+                continue
+            with_vbases += 1
+            found = []
+            for i, v in enumerate(order):
+                off = self.mem.read_int(prim.address - (3 + i) * p, p)
+                if off is None or off < 0 or off >= MAX_OBJECT:
+                    break
+                if v.typeinfo in primaries and (off == 0 or off not in offsets[ti]):
+                    break
+                found.append(off)
+            landed = [found[i] for i, v in enumerate(order) if i < len(found) and v.typeinfo in primaries]
+            ok = len(found) == len(order) and len(set(landed)) == len(landed)
+            trusted += ok
+            prim.vbases = [BaseRef(v.name, found[i] if ok else None, True, v.typeinfo)
+                           for i, v in enumerate(order)]
+        if with_vbases:
+            log("[oorecover] %d classes with virtual bases, %d with vbase offsets read from the vtable header"
+                % (with_vbases, trusted))
+
+    def _vbase_order(self, ti, primaries, depth=0, out=None, seen=None):
+        """Virtual bases of the class ti describes in vbase offset order:
+        those of its primary base (the first non-virtual polymorphic base
+        at offset 0) first, then its own, each once, in inheritance graph
+        order: a depth-first walk of the RTTI bases in declaration order."""
+        out = [] if out is None else out
+        seen = set() if seen is None else seen
+        parsed = self.parse_typeinfo(ti)
+        if parsed is None or depth > MAX_DEPTH:
+            return out
+        primary = next((b for b in parsed[1]
+                        if not b.virtual and b.offset == 0 and b.typeinfo in primaries), None)
+        if primary is not None:
+            self._vbase_order(primary.typeinfo, primaries, depth + 1, out, seen)
+        for v in self._preorder_vbases(ti):
+            if v.typeinfo not in seen:
+                seen.add(v.typeinfo)
+                out.append(v)
+        return out
+
+    def _preorder_vbases(self, ti, depth=0, out=None, visited=None):
+        # A second walk of a class finds no virtual base the first missed.
+        out = [] if out is None else out
+        visited = set() if visited is None else visited
+        parsed = self.parse_typeinfo(ti)
+        if parsed is None or depth > MAX_DEPTH:
+            return out
+        for b in parsed[1]:
+            if b.typeinfo in visited:
+                continue
+            visited.add(b.typeinfo)
+            if b.virtual:
+                out.append(b)
+            self._preorder_vbases(b.typeinfo, depth + 1, out, visited)
+        return out
 
     def symbol_candidates(self):
         p = self.mem.ptrsize

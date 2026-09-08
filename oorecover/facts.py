@@ -33,6 +33,8 @@ class VtableInfo:
     sym_addr: Optional[int] = None  # the vtable symbol this table belongs to
     sym_name: Optional[str] = None  # class name decoded from that symbol
     construction: Optional[str] = None  # derived class whose constructors use this construction vtable
+    vbases: list = field(default_factory=list)  # [BaseRef] every virtual base of the class, direct or
+                                                # indirect, in vbase-offset order; offset when the header gave it
 
     @property
     def functions(self):

@@ -517,6 +517,143 @@ def check_folded(name):
             assert cls["name"] + "* this" in cls["functions"][fn]["type"], (name, cls["name"], cls["functions"][fn])
 
 
+def check_complete_dtors(name, rep):
+    """Itanium keeps the complete destructor (D1) in the slot before the
+    deleting one (D0). The model finds D0 from its operator delete call; the
+    slot before it is D1 and gets named dtor_complete, listed under dtors.
+    Symbol builds keep their mangled names. MSVC has one destructor slot."""
+    if rep["abi"] != "itanium":
+        return
+    symbols = name in SYMBOL_FIXTURES
+    pairs = []
+
+    def deleting(cls, slots, i):
+        """Slot i holds the class's deleting destructor: a D0 symbol, or an
+        auto-named dtor that is not the first of a dtor/dtor_1 pair (both
+        destructors found by the model, D1 first)."""
+        fn = slots[i]
+        if fn is None or fn not in cls["dtors"] or fn in cls["thunks"]:
+            return False
+        n = cls["functions"][fn]["name"]
+        if symbols:
+            return bool(re.fullmatch(r"_ZN.*D0Ev", n))
+        if n != cls["name"] + "::dtor":
+            return False
+        nxt = slots[i + 1] if i + 1 < len(slots) else None
+        return not (nxt in cls["dtors"] and cls["functions"][nxt]["name"] == cls["name"] + "::dtor_1")
+
+    for cls in rep["classes"]:
+        slots = cls["vtables"].get("0", {}).get("slots", [])
+        for i, fn in enumerate(slots):
+            info = cls["functions"].get(fn)
+            if info is not None and info["name"].endswith("::dtor_complete"):
+                assert i + 1 < len(slots) and deleting(cls, slots, i + 1), \
+                    (name, cls["name"], "dtor_complete not followed by the deleting destructor", i, slots[i:i + 2])
+                assert info["name"] == cls["name"] + "::dtor_complete" and fn in cls["dtors"], (name, cls["name"], info)
+            if i == 0 or not deleting(cls, slots, i):
+                continue
+            d1 = slots[i - 1]
+            if d1 not in cls["functions"] or d1 == fn or d1 in cls["thunks"]:
+                continue
+            pairs.append((cls, d1, fn))
+            assert d1 in cls["dtors"], (name, cls["name"], "complete destructor not listed", d1, cls["dtors"])
+            n1 = cls["functions"][d1]["name"]
+            if symbols:
+                assert re.fullmatch(r"_ZN.*D[12]Ev", n1), (name, cls["name"], n1)
+            else:
+                assert n1 == cls["name"] + "::dtor_complete", (name, cls["name"], n1)
+    assert pairs, (name, "no destructor pair found")
+    cmap = {c["name"]: c for c in rep["classes"]}
+    if "zoo::Animal" in cmap:
+        animal = cmap["zoo::Animal"]
+    elif name in INLINED_CTORS:
+        return   # -O2 devirtualises use(Animal*): nothing singles Animal out
+    else:
+        # Animal's table is the one use(Animal*) dispatches through.
+        animal = cmap[max(rep["vcalls"], key=lambda v: len(v["targets"]))["class"]]
+    slots = animal["vtables"]["0"]["slots"]
+    d1, d0 = slots[0], slots[1]
+    assert d0 in animal["dtors"], (name, animal["name"], animal["dtors"])
+    if d1 not in animal["functions"]:
+        # The linker folded the empty ~Animal() with unrelated destructors
+        # (testprog_icf): it is nobody's, so it must not be claimed as Animal's.
+        assert name in FOLDED_FIXTURES and d1 not in animal["dtors"], (name, animal["name"], d1, animal["dtors"])
+        return
+    assert d1 in animal["dtors"], (name, animal["name"], "complete destructor not listed", d1, animal["dtors"])
+    n1, n0 = animal["functions"][d1]["name"], animal["functions"][d0]["name"]
+    if symbols:
+        assert (n1, n0) == ("_ZN3zoo6AnimalD1Ev", "_ZN3zoo6AnimalD0Ev"), (name, n1, n0)
+        return
+    assert (n1, n0) == (animal["name"] + "::dtor_complete", animal["name"] + "::dtor"), (name, n1, n0)
+    members = animal["vtbl_types"]["0"]["members"]
+    assert [m[1] for m in members[:2]] == ["dtor_complete", "dtor"], (name, members[:2])
+
+
+def log_section(name):
+    """Lines the autotest run logged for one fixture, [] without a log."""
+    try:
+        with open(os.path.join(REPORTS, "autotest.log")) as f:
+            lines = f.read().split("\n")
+    except FileNotFoundError:
+        return []
+    out, inside = [], False
+    for line in lines:
+        if line.startswith("=== "):
+            inside = line[4:].strip() == name
+        elif inside:
+            out.append(line)
+    return out
+
+
+def check_virtual_base(name, rep):
+    """Lion inherits Cat's virtual base Animal, which Lion's own RTTI never
+    lists, yet Lion's vtable group carries a secondary table for the Animal
+    sub-object. The vbase offset in Lion's primary table header (Itanium) or
+    the one table no non-virtual base explains (MSVC) attributes it: Lion
+    gains Animal as a virtual base at that offset, the table is Lion's,
+    its overrides' thunks belong to Lion typed with Animal's this, its
+    slots are typed, and calls through an Animal* reach Lion's overrides.
+    Cat's own virtual base gets the offset of its own secondary table."""
+    if name not in RTTI_FIXTURES:
+        return
+    itanium = rep["abi"] == "itanium"
+    p = rep["ptrsize"]
+    cmap = {c["name"]: c for c in rep["classes"]}
+    lion, cat, animal = cmap["zoo::Lion"], cmap["zoo::Cat"], cmap["zoo::Animal"]
+    cat_animal = base_map(cat)["zoo::Animal"]
+    cat_off = cat_animal["offset"]
+    assert cat_animal["virtual"] and cat_off is not None, (name, cat["bases"])
+    assert sorted(int(o) for o in cat["vtables"]) == [0, cat_off], (name, cat["vtables"], cat_off)
+    lb = base_map(lion)
+    assert lb["zoo::Cat"] == {"name": "zoo::Cat", "offset": 0, "virtual": False}, (name, lion["bases"])
+    assert "zoo::Animal" in lb and lb["zoo::Animal"]["virtual"] is True, (name, lion["bases"])
+    off = lb["zoo::Animal"]["offset"]
+    if itanium:
+        # vptr, lives, then mane: it fits Cat's tail padding on x86-64 only.
+        assert off == {8: 16, 4: 12}[p], (name, lion["bases"])
+    else:
+        assert off > cat_off, (name, lion["bases"], cat_off)
+    assert sorted(int(o) for o in lion["vtables"]) == [0, off], (name, lion["vtables"], off)
+    table = lion["vtables"][str(off)]
+    assert len(table["slots"]) == len(animal["vtables"]["0"]["slots"]), (name, table, animal["vtables"]["0"])
+    typed = lion["vtbl_types"][str(off)]
+    assert typed and len(typed["members"]) == len(table["slots"]), (name, off, typed)
+    thunks = [fn for fn in table["slots"] if fn in lion["thunks"]]
+    assert len(thunks) >= 3 and all(lion["thunks"][fn] == off for fn in thunks), (name, table, lion["thunks"])
+    for fn in thunks:
+        assert "zoo::Animal*" in lion["functions"][fn]["type"], (name, fn, lion["functions"][fn])
+    inherited = [fn for fn in table["slots"] if fn in animal["methods"]]
+    assert inherited, (name, "Animal's own slots not left to Animal", table)
+    assert not any(fn in lion["methods"] or fn in lion["dtors"] for fn in inherited), (name, table, lion["methods"])
+    # use(&lion): legs() through an Animal* reaches Lion::legs by its thunk.
+    resolved = [v for v in rep["vcalls"] if v["class"] == "zoo::Animal" and not v["exact"]
+                and any(t in thunks for t in v["targets"])]
+    assert len(resolved) >= 2, (name, "Lion's overrides missing from Animal* calls",
+                                [v["targets"] for v in rep["vcalls"] if v["class"] == "zoo::Animal"])
+    stray = [line for line in log_section(name) if "zoo::Lion:" in line and "has no base there" in line]
+    assert not stray, (name, stray)
+
+
 def main(argv):
     names = argv or [n for n in RTTI_FIXTURES + NORTTI_FIXTURES + NAMED_NORTTI_FIXTURES + FOLDED_FIXTURES
                      if os.path.exists(os.path.join(REPORTS, n + ".json"))]
@@ -535,7 +672,9 @@ def main(argv):
             check_puppy(name, load(name))
             check_struct_returns(name, load(name))
             check_construction(name, load(name))
+            check_virtual_base(name, load(name))
             check_nonvirtual(name, load(name))
+            check_complete_dtors(name, load(name))
             check_kennel(name, load(name))
             print("ok  ", name)
         except AssertionError as e:

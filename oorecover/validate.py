@@ -109,9 +109,11 @@ def check_structure(classes, alloc_sizes, extent=None, log=print):
     # allocations request (sizeof), and the offset at which the next base
     # starts in any class deriving from it. A member past either was read by
     # a method of some derived class that this class was credited with.
+    # A virtual base lies past the members of the class deriving from it and
+    # a class's size here covers its own virtual bases, so those bound nothing.
     bounds = {name: (size, "allocated %d" % size) for name, size in alloc_sizes.items()}
     for c in classes:
-        laid = [(b.offset, b.name) for b in c.bases if b.offset is not None]
+        laid = [(b.offset, b.name) for b in c.bases if b.offset is not None and not b.virtual]
         offsets = sorted({off for off, _name in laid})
         for off, name in laid:
             # Empty bases share an offset with a real one; the bound is the
@@ -140,7 +142,7 @@ def check_structure(classes, alloc_sizes, extent=None, log=print):
         ranges = []
         for b in c.bases:
             bc = by_name.get(b.name)
-            if b.offset is None or bc is None or bc.size <= 0:
+            if b.offset is None or b.virtual or bc is None or bc.size <= 0:
                 continue
             for name, start, end in ranges:
                 if b.offset < end and start < b.offset + bc.size:

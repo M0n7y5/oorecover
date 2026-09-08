@@ -124,12 +124,19 @@ def derives_from(cls, other, by_name, depth=0):
     return False
 
 
+def _placed(b, depth):
+    """Whether base b sits at b.offset when walked from depth: a virtual
+    base's offset holds in the complete object of the class listing it,
+    not inside that class as a sub-object of another."""
+    return b.offset is not None and not (b.virtual and depth > 0)
+
+
 def base_at(cls, off, by_name, depth=0):
     """Name of the base class whose sub-object starts at `off` in cls."""
     if depth > 32:
         return None
     for b in cls.bases:
-        if b.offset is None or b.name is None:
+        if not _placed(b, depth) or b.name is None:
             continue
         if b.offset == off:
             return b.name
@@ -151,7 +158,7 @@ def member_class_at(cls, off, by_name, depth=0):
         return by_name.get(name)
     for b in cls.bases:
         bc = by_name.get(b.name)
-        if bc is not None and bc is not cls and b.offset is not None and b.offset <= off:
+        if bc is not None and bc is not cls and _placed(b, depth) and b.offset <= off:
             inner = member_class_at(bc, off - b.offset, by_name, depth + 1)
             if inner is not None:
                 return inner
@@ -262,7 +269,7 @@ def build_model(bv, mem, tables, facts, log=print):
         names.add(name)
         return name
 
-    def add_group(cls, group, base_offsets=None):
+    def add_group(cls, group, base_offsets=None, note=""):
         """Attach a class's tables by sub-object offset. Tables at an offset
         no base explains come from a neighbouring class whose symbol or
         typeinfo they share; only RTTI names the offsets, so unnamed groups
@@ -270,8 +277,8 @@ def build_model(bv, mem, tables, facts, log=print):
         for t in group:
             off = t.object_offset
             if base_offsets is not None and off != 0 and off not in base_offsets:
-                log("[oorecover] %s: table %#x at offset %d has no base there; ignored"
-                    % (cls.name, t.address, off))
+                log("[oorecover] %s: table %#x at offset %d has no base there; ignored%s"
+                    % (cls.name, t.address, off, note))
                 continue
             prev = cls.vtables.get(off)
             if prev is not None:
@@ -281,6 +288,43 @@ def build_model(bv, mem, tables, facts, log=print):
             cls.vtables[off] = t
             owner[t.address] = cls
         classes.append(cls)
+
+    def sub_offsets(ti, at, out, depth=0):
+        """Offsets of every non-virtual base sub-object, direct or indirect,
+        of the class ti describes when it sits at `at`."""
+        if depth > 32:
+            return
+        for b in bases_by_ti.get(ti, ()):
+            if b.offset is not None:
+                out.add(at + b.offset)
+                sub_offsets(b.typeinfo, at + b.offset, out, depth + 1)
+
+    def virtual_sub_objects(cls, group, primary, explained):
+        """Explain the group's tables at offsets no non-virtual base chain
+        reaches through the class's virtual bases: at the vbase offsets its
+        primary table's header lists, else the one unexplained table of a
+        class with one virtual base. A virtual base found gets its offset
+        (a direct one already listed keeps its entry). Returns the tables
+        left ambiguous."""
+        pending = {t.object_offset for t in group} - explained - {0}
+        if not primary.vbases:
+            return 0
+        known = {v.typeinfo: v.offset for v in primary.vbases if v.offset is not None}
+        if not known and len(pending) == 1 and len(primary.vbases) == 1:
+            known = {primary.vbases[0].typeinfo: next(iter(pending))}
+        for v in primary.vbases:
+            off = known.get(v.typeinfo)
+            if off is None:
+                continue
+            listed = next((b for b in cls.bases if b.virtual and b.typeinfo == v.typeinfo), None)
+            if listed is not None:
+                listed.offset = off
+            elif off in pending:
+                cls.bases.append(BaseRef(v.name, off, True, v.typeinfo))
+            if off in pending:
+                explained.add(off)
+                sub_offsets(v.typeinfo, off, explained, 1)
+        return len(pending - explained)
 
     def group_by(key):
         groups = {}
@@ -299,12 +343,18 @@ def build_model(bv, mem, tables, facts, log=print):
     # class nor votes for one, and is recorded on the class it lays out.
     construction = [t for t in tables if t.construction]
     tables = [t for t in tables if not t.construction]
-    for ti, group, primary in group_by(lambda t: t.typeinfo_addr if t.has_rtti else None):
+    rtti_groups = group_by(lambda t: t.typeinfo_addr if t.has_rtti else None)
+    bases_by_ti = {ti: primary.bases for ti, _group, primary in rtti_groups}
+    for ti, group, primary in rtti_groups:
         cls = ClassModel(unique(primary.rtti_name or "class_%x" % primary.address,
                                 primary.address), ti)
         cls.bases = [BaseRef(b.name, b.offset, b.virtual, b.typeinfo) for b in primary.bases]
-        offsets = {b.offset for b in cls.bases if b.offset is not None}
-        add_group(cls, group, None if any(b.virtual for b in cls.bases) else offsets)
+        explained = set()
+        sub_offsets(ti, 0, explained)
+        ambiguous = virtual_sub_objects(cls, group, primary, explained)
+        note = (" (%d virtual bases, %d tables unexplained)" % (len(primary.vbases), ambiguous)
+                if ambiguous else "")
+        add_group(cls, group, None if any(b.virtual for b in primary.bases) else explained, note)
         for t in construction:
             if t.typeinfo_addr == ti:
                 cls.construction.setdefault(t.construction, {})[t.object_offset] = t
@@ -391,7 +441,7 @@ def build_model(bv, mem, tables, facts, log=print):
         if depth > 32:
             return False
         for b in cls.bases:
-            if b.offset is None:
+            if not _placed(b, depth):
                 continue
             bc = by_name.get(b.name)
             if bc is None:
@@ -479,6 +529,11 @@ def build_model(bv, mem, tables, facts, log=print):
         for root, installs in roots.items():
             by_off = group_installs(installs)
             if 0 not in by_off:
+                continue
+            last = table_at[by_off[0][-1].vtable]
+            if primary_table(owner[last.address]) is not last:
+                # A secondary table of its class stored at the root: the root
+                # is a sub-object of an object built elsewhere.
                 continue
             cands = [owner[i.vtable] for i in by_off[0]]
             own = derived_most(cands)
@@ -954,12 +1009,13 @@ def plain_classes(bv, facts, taken, log=print):
 
 
 def base_offset_in(derived, base, by_name, depth=0):
-    """Offset of the (non-virtual) base sub-object of `base` inside `derived`,
-    or None when base is not a non-virtual ancestor."""
+    """Offset of the base sub-object of `base` inside `derived`, or None
+    when base is not an ancestor at a known offset: a non-virtual one, or a
+    virtual base derived's own record places."""
     if depth > 32:
         return None
     for b in derived.bases:
-        if b.offset is None:
+        if not _placed(b, depth):
             continue
         bc = by_name.get(b.name)
         if bc is None:
@@ -1137,7 +1193,7 @@ def type_member_pointers(classes, facts, site_class, root_class, by_name, ptrsiz
             return out
         for b in cls.bases:
             bc = by_name.get(b.name)
-            if bc is not None and bc is not cls and b.offset is not None and b.offset <= off:
+            if bc is not None and bc is not cls and _placed(b, depth) and b.offset <= off:
                 out += gather(bc, off - b.offset, depth + 1)
         return out
 
@@ -1300,9 +1356,10 @@ def infer_param_classes(bv, classes, facts, claimed, site_class, by_name, log=pr
 
 def base_table_offset(derived, base, by_name):
     """Object offset of the vtable inside `derived` that serves the `base`
-    sub-object. Non-virtual bases have static offsets; a virtual base's
-    sub-object sits at a runtime offset, but derived's own table for it is
-    the one secondary table no non-virtual base chain explains."""
+    sub-object. Non-virtual bases have static offsets and a virtual base
+    keeps the one its vtable header gave; otherwise derived's own table for
+    a virtual base is the one secondary table no non-virtual base chain
+    explains."""
     off = base_offset_in(derived, base, by_name)
     if off is not None:
         return off
@@ -1313,7 +1370,7 @@ def base_table_offset(derived, base, by_name):
             return out
         for b in cls.bases:
             bc = by_name.get(b.name)
-            if bc is not None and b.offset is not None:
+            if bc is not None and _placed(b, depth + 1):
                 out |= explained(bc, at + b.offset, depth + 1)
         return out
 

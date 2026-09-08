@@ -104,6 +104,8 @@ def _scan_with(bv, mem, abi, log, progress=None, cancelled=None):
         tables.append(info)
     if hasattr(abi, "mark_construction_tables"):
         abi.mark_construction_tables(tables, log)
+    if hasattr(abi, "read_virtual_bases"):
+        abi.read_virtual_bases(tables, log)
     return tables
 
 
