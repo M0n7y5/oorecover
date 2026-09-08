@@ -599,7 +599,7 @@ def build_model(bv, mem, tables, facts, log=print, rtti_bases=None):
                 elif c.callee in prim.functions or not any(c.callee in o.dtors for o in classes):
                     cls.dtors.add(c.callee)
 
-    plain = plain_classes(bv, facts, names, log)
+    plain = plain_classes(bv, facts, names, log, {c.name: c for c in bridged.values()})
     classes.extend(plain)
     names.update(c.name for c in plain)
 
@@ -640,7 +640,9 @@ def build_model(bv, mem, tables, facts, log=print, rtti_bases=None):
         for fn in cls.ctors | cls.dtors:
             claimed.setdefault(fn, cls)
     for cls in order:
-        if cls.plain:
+        if cls.plain or not cls.vtables:
+            # Named members of a class with no table of its own, plain or
+            # made from RTTI, are its methods outright.
             for fn in cls.methods:
                 claimed.setdefault(fn, cls)
     # One function listed by classes that are not related by inheritance is
@@ -1011,18 +1013,23 @@ def resolve_result_types(bv, classes, facts, claimed, vcalls, log=print):
 MAX_PLAIN_MEMBER_GAP = 1 << 16
 
 
-def plain_classes(bv, facts, taken, log=print):
+def plain_classes(bv, facts, taken, log=print, fill=None):
     """Classes with no vtable, known only through mangled member functions
     that read this. Constructors and destructors come from their mangled
-    roles; every other member reading this is a method."""
+    roles; every other member reading this is a method. `fill` names
+    classes made from RTTI alone (bases with no vtable of their own) that
+    take their member functions the same way instead of a class of their own."""
+    fill = fill or {}
     groups = {}
     for faddr, ff in facts.items():
-        if ff.member_of is None or ff.member_of in taken or not ff.entry_this:
+        if ff.member_of is None or not ff.entry_this:
+            continue
+        if ff.member_of in taken and ff.member_of not in fill:
             continue
         groups.setdefault(ff.member_of, []).append(faddr)
     out = []
     for name, fns in sorted(groups.items()):
-        cls = ClassModel(name, plain=True)
+        cls = fill.get(name) or ClassModel(name, plain=True)
         for fn in fns:
             role = symbol_role(bv, fn)
             if role == "ctor":
@@ -1031,7 +1038,8 @@ def plain_classes(bv, facts, taken, log=print):
                 cls.dtors.add(fn)
             else:
                 cls.methods.add(fn)
-        out.append(cls)
+        if name not in fill:
+            out.append(cls)
     log("[oorecover] plain classes (no vtable): %d from %d member functions"
         % (len(out), sum(len(f) for f in groups.values())))
     return out
