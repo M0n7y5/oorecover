@@ -16,7 +16,7 @@ from binaryninja.enums import NamedTypeReferenceClass, SymbolType, TypeClass
 
 from .model import topo_order, base_at
 from .names import (META_TYPES, demangle, mangled, mangled_class, member, member_class,
-                    msvc_static, split_qualified)
+                    msvc_static, split_qualified, symbol_role)
 
 _META_KEY = META_TYPES
 _NAMES_KEY = "oorecover.functions"
@@ -229,6 +229,48 @@ def _same_type(a, b):
 
 def _short(name):
     return name.split("::")[-1]
+
+
+def _deleting_dtor(bv, cls, fn, facts):
+    """True for the class's deleting destructor: a mangled D0 symbol, or a
+    destructor of the model whose facts show it freeing this (D1 and D2 also
+    land in cls.dtors: they install the base's table last as well)."""
+    sym = bv.get_symbol_at(fn)
+    if sym is not None and symbol_role(bv, fn) == "dtor":
+        return sym.raw_name.endswith("D0Ev")
+    ff = facts.get(fn) if facts else None
+    return fn in cls.dtors and ff is not None and any(c.dealloc for c in ff.calls)
+
+
+def _named_complete(bv, fn, own_functions):
+    func = bv.get_function_at(fn)
+    return func is not None and fn in own_functions and func.symbol is not None \
+        and func.symbol.short_name.endswith("::dtor_complete")
+
+
+def _complete_dtors(bv, cls, own_functions, facts):
+    """Itanium puts the complete destructor in the slot before the deleting
+    one; the model only recognises the latter (it calls operator delete), so
+    the slot before an owned deleting destructor is the class's complete
+    destructor when the class owns it too. A destructor the model did find
+    there keeps its own name unless an earlier run of ours named it."""
+    t = cls.vtables.get(0)
+    found = set()
+    if t is None:
+        return found
+    slots = t.slots
+    for i in range(1, len(slots)):
+        fn, prev = slots[i], slots[i - 1]
+        if fn is None or prev is None or prev == fn or fn in cls.thunks:
+            continue
+        if not _deleting_dtor(bv, cls, fn, facts):
+            continue
+        if prev not in cls.methods and prev not in cls.dtors:
+            continue
+        if prev in cls.dtors and not _named_complete(bv, prev, own_functions):
+            continue
+        found.add(prev)
+    return found
 
 
 def _slot_label(func, index):
@@ -742,12 +784,15 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                         return _named_ptr(bv, b.name)
                 return cls_ptr
 
+            complete = _complete_dtors(bv, cls, own_functions, facts) if abi == "itanium" else set()
             jobs = []
             for i, fn in enumerate(sorted(cls.ctors)):
                 jobs.append((fn, "ctor" if i == 0 else "ctor_%d" % i, cls_ptr))
-            for i, fn in enumerate(sorted(cls.dtors)):
+            for i, fn in enumerate(sorted(cls.dtors - complete)):
                 jobs.append((fn, "dtor" if i == 0 else "dtor_%d" % i, cls_ptr))
-            for fn in sorted(cls.methods):
+            for fn in sorted(complete):
+                jobs.append((fn, "dtor_complete", cls_ptr))
+            for fn in sorted(cls.methods - complete):
                 jobs.append((fn, "vfunc_%d" % slot_index.get(fn, 0), cls_ptr))
             for fn in sorted(cls.nonvirtual):
                 jobs.append((fn, "method_%x" % fn, cls_ptr))
@@ -755,6 +800,9 @@ def apply_model(bv, classes, log=print, progress=None, vcalls=(), abi="itanium",
                 jobs.append((fn, "thunk_%x_%d" % (off, slot_index.get(fn, 0)), base_ptr_at(off)))
             for fn, slot in sorted(cls.shared.items()):
                 jobs.append((fn, "shared_vfunc_%d" % slot, cls_ptr))
+            # The report lists the complete destructor with the deleting one.
+            cls.dtors |= complete
+            cls.methods -= complete
             for fn, label, this_ptr in jobs:
                 func = bv.get_function_at(fn)
                 if func is None:
