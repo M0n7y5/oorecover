@@ -100,7 +100,7 @@ struct zoo::Animal {                    // width 24
 
 - Install: clone into `~/.binaryninja/plugins/oorecover` and restart Binary Ninja (Python 3 plugin, `minimumsupportedversion` 4300 in `plugin.json`). Run `Plugins > OORecover > Recover C++ Classes` (PluginCommand `OORecover\Recover C++ Classes`); it is a cancellable background task with progress text `OORecover: ...`.
 - Two passes. Pass 1 recovers and applies; functions whose signatures hid `this` now carry it, so call sites carry arguments. Pass 2 re-collects only the changed functions and their callers and reuses the other facts. Log lines (`oorecover` logger) to look for: `model: N classes, ...`, `applied N class types (...)`, `pass 2 done`, and finally `oorecover: N classes (itanium ABI)`.
-- Time: the fixture binaries take seconds. On a 3 GB database with about 6900 classes the two passes take about 19 minutes, most of it Binary Ninja producing MLIL. A database typed by an earlier run reuses its facts and skips types and signatures that are already identical (`N types unchanged`, `N left as they were`). Each run is one undo action.
+- Time: the fixture binaries take seconds. On a 3 GB database with about 6900 classes the two passes take about 14 minutes, most of it Binary Ninja producing MLIL. A database typed by an earlier run reuses its facts and skips types and signatures that are already identical (`N types unchanged`, `N left as they were`). Each run is one undo action.
 - What is written: struct types per class, `<Class>::VTable` struct types (secondary tables get `VTable_<offset>`, construction vtables `<Derived>::VTable_ctor_<Base>`), vtable data variables and symbols where Binary Ninja had none, function symbols for auto-named methods (`ctor`, `dtor`, `vfunc_N`, `thunk_<offset>_<slot>`, `method_<addr>`), user function types with `this`, user code references from virtual call sites, types on static instances, and two metadata keys: `oorecover.types` (types a run defined) and `oorecover.functions` (functions it named). Kept: existing user types not created by a previous run (logged `<name>: type exists, kept`), Binary Ninja's RTTI vtable types (updated in place under their names) and its symbols.
 
 ## What it recovers
@@ -134,6 +134,7 @@ struct zoo::Animal {                    // width 24
 - A class known only through unrelated non-const members has no class evidence and is treated as a namespace.
 - A method whose only buffer write is a copy of a member keeps its `_result` placeholder.
 - Call sites with more than 32 candidate targets get a cross-reference to the static class's own slot only (`N sites capped`).
+- A member is typed as a class pointer only from objects stored into it whole at a construction site or through `this`; pointers that arrive only through untyped globals or unknown callees stay `void*`.
 - Functions discovered during pass 2 are not visited (`pass 2 done; N functions discovered late, not visited`).
 
 ## Development
@@ -156,7 +157,7 @@ In-GUI runs: with Binary Ninja open, write the fixture paths one per line to `te
 
 Offline tests, each runnable with plain `python3`: `tests/check_names.py` (undefined-name scan of the sources, which hot reload hides; no Binary Ninja needed), `tests/test_validate.py` (consistency rules on synthetic models) and `tests/test_demangle.py` (typeinfo and MSVC type name demangling). The last two import the plugin package, which imports `binaryninja`, so put the Binary Ninja Python API on `PYTHONPATH`.
 
-Directives: `tests/trace.txt` with `0xADDR` words (plus `after-apply` to trace after a first recover-and-apply, `callers` to include callers) makes the next run trace those functions instead of recovering; `tests/decompile.txt` with `0xADDR [label]` lines makes it write each function's Pseudo C before and after the run to `tests/reports/<fixture>.decompile.md`; `tests/reanalyze.txt` makes it discard the saved analysis and reanalyse the whole binary first, to measure what a core upgrade changes. All three files are gitignored.
+Directives: `tests/trace.txt` with `0xADDR` words (plus `after-apply` to trace after a first recover-and-apply, `callers` to include callers) makes the next run trace those functions instead of recovering; `tests/decompile.txt` with `0xADDR [label]` lines makes it write each function's Pseudo C before and after the run to `tests/reports/<fixture>.decompile.md`; `tests/reanalyze.txt` makes it discard the saved analysis and reanalyse the whole binary first, to measure what a core upgrade changes. All three files are gitignored. A `tests/trace.txt` run still writes `tests/reports/<fixture>.json`, with the empty trace result: copy a report you want to keep before tracing.
 
 ## Binary Ninja 6.0 notes
 
